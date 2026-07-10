@@ -784,6 +784,20 @@ class WorkflowEngine:
         # P1-3: Track initial Worker output for Verifier context
         initial_worker_output = current_content
 
+        # Artifact version chain — Worker 初稿 v1
+        artifact_id = f"ART-{subtask_id}"
+        self.artifact_store.save(
+            artifact_id=artifact_id,
+            content=current_content,
+            metadata={
+                "stage": "worker_draft",
+                "task_name": subtask.get("task_name", ""),
+                "worker_model": worker_model,
+                "worker_status": worker_resp.status,
+            },
+            version=1,
+        )
+
         if worker_resp.needs_review():
             decision = self.supervisor.event_handling.handle("low_confidence", {"role": "Worker", "subtask": subtask.get("task_name", "")})
             self._publish_replan_signal(workflow_id, subtask_id, worker_resp, "worker_low_confidence")
@@ -878,6 +892,21 @@ class WorkflowEngine:
             if revision_resp.needs_review():
                 self._publish_replan_signal(workflow_id, subtask_id, revision_resp, "revision_low_confidence")
 
+        # Artifact version chain — Critic 修订版 v2
+        self.artifact_store.save(
+            artifact_id=artifact_id,
+            content=current_content,
+            metadata={
+                "stage": "critic_revised",
+                "task_name": subtask.get("task_name", ""),
+                "worker_model": worker_model,
+                "critic_model": critic_model,
+                "revision_count": len(all_critic_findings),
+                "critic_status": critic_resp.status,
+            },
+            version=2,
+        )
+
         # P1-3: Verifier TaskContract with complete context
         verifier_objective = (
             f"验证最终版本是否满足要求。原始目标: {subtask.get('objective', '')}。"
@@ -899,6 +928,19 @@ class WorkflowEngine:
         )
         # P1-3: Verifier receives full context — initial output, critic findings, final output
         verifier_context_messages: list[ChatMessage] = []
+
+        # Artifact version chain reference for Verifier
+        existing_versions = self.artifact_store.list_versions(artifact_id)
+        if existing_versions:
+            chain_summary = "\n".join(
+                f"- v{v.version} ({v.metadata.get('stage', 'unknown')}): {v.content[:100]}"
+                for v in existing_versions
+            )
+            verifier_context_messages.append(ChatMessage(
+                role="system",
+                content=f"## 产物版本链 (ART-{subtask_id})\n\n{chain_summary}",
+            ))
+
         verifier_context_messages.append(ChatMessage(
             role="system",
             content=f"## Worker 初稿\n\n{initial_worker_output[:2000]}",
@@ -923,12 +965,16 @@ class WorkflowEngine:
         if verifier_resp.needs_review() or "fail" in (verifier_resp.next_action_recommendation or "").lower():
             self._publish_replan_signal(workflow_id, subtask_id, verifier_resp, "verifier_failed")
 
+        # Artifact version chain — Verifier 通过版 v3
+        ver_chain_ids = [av.to_dict() for av in self.artifact_store.list_versions(artifact_id)]
         self.artifact_store.save(
-            artifact_id=f"ART-{subtask_id}",
+            artifact_id=artifact_id,
             content=current_content,
             metadata={
+                "stage": "verifier_final",
                 "task_name": subtask.get("task_name", ""),
                 "worker_status": worker_resp.status,
+                "critic_status": critic_resp.status,
                 "verifier_status": verifier_resp.status,
                 "worker_model": worker_model,
                 "critic_model": critic_model,
@@ -936,7 +982,9 @@ class WorkflowEngine:
                 "allowed_tools": allowed_tools,
                 "workspace_root": self.runtime_config.get("workspace_root", ""),
                 "permission_mode": self.runtime_config.get("permission_mode", "workspace_only"),
+                "version_chain_ids": ver_chain_ids,
             },
+            version=3,
         )
         return {
             "worker": worker_resp,

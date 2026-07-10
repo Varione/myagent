@@ -127,14 +127,33 @@ class ArtifactStore:
     # -- CRUD --
 
     def save(self, artifact_id: str, content: str,
-             metadata: dict = None) -> ArtifactVersion:
-        """保存新版本（自动递增版本号，保证版本链无缝）"""
+             metadata: dict = None, version: int = None) -> ArtifactVersion:
+        """保存新版本（自动递增版本号，保证版本链无缝）
+
+        Args:
+            artifact_id: 产物标识符
+            content: 产物内容
+            metadata: 附加元数据
+            version: 显式指定版本号。为 None 时自动递增。
+                     指定时必须等于当前最大版本 +1，否则抛出 ValueError。
+        """
         conn = self._get_conn()
         row = conn.execute(
             "SELECT MAX(version) FROM artifact WHERE artifact_id = ?",
             (artifact_id,),
         ).fetchone()
-        next_ver = (row[0] + 1) if row and row[0] is not None else 1
+        max_ver = row[0] if row and row[0] is not None else 0
+
+        if version is not None:
+            expected = max_ver + 1
+            if version != expected:
+                raise ValueError(
+                    f"版本不连续: artifact_id={artifact_id}, "
+                    f"期望 v{expected}，收到 v{version}"
+                )
+            next_ver = version
+        else:
+            next_ver = max_ver + 1
 
         metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
         now = datetime.now(timezone.utc).isoformat()
@@ -237,6 +256,15 @@ class ArtifactStore:
     def chain_is_valid(self, artifact_id: str) -> bool:
         """返回版本链是否完整无间隙"""
         return len(self.verify_chain(artifact_id)) == 0
+
+    def get_latest_version(self, artifact_id: str) -> int:
+        """返回当前最大版本号，不存在时返回 0"""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT MAX(version) FROM artifact WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        return row[0] if row and row[0] is not None else 0
 
     # -- Helper --
 
