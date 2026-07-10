@@ -146,7 +146,10 @@ class ToolExecutor:
         )
 
         # 第一步：检查是否在允许的工具列表中
-        if allowed_tools and tool_call.tool_name not in allowed_tools:
+        # None = use default policy (skip this check)
+        # []    = block all tools explicitly
+        # ["x"] = allow only listed tools
+        if allowed_tools is not None and tool_call.tool_name not in allowed_tools:
             record.permission_allowed = False
             record.permission_reason = (
                 f"Tool '{tool_call.tool_name}' not in allowed list: {allowed_tools}"

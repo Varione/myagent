@@ -84,7 +84,7 @@ ACTION_LEVELS: dict[str, ActionLevel] = {
     "blackboard_read": ActionLevel.SAFE,
     "blackboard_write": ActionLevel.SAFE,
     "read_artifact": ActionLevel.SAFE,
-    "code_execute": ActionLevel.SAFE,
+    "code_execute": ActionLevel.CRITICAL,
     "database_query": ActionLevel.SAFE,
     # Risky — 需 Supervisor 审批
     "api_call": ActionLevel.RISKY,
@@ -154,7 +154,7 @@ class PermissionManager:
     权限管理器：管理角色权限矩阵和操作分级。
 
     Usage:
-        pm = PermissionManager()
+        pm = PermissionManager(mode="workspace_only")
 
         # 检查权限
         result = pm.check("Worker", "code_execute", task_id="T1")
@@ -169,11 +169,26 @@ class PermissionManager:
         pm.set_permissions("CustomRole", {"blackboard_read", "custom_action"})
     """
 
-    def __init__(self, matrix: Optional[dict[str, set[str]]] = None):
+    def __init__(self, matrix: Optional[dict[str, set[str]]] = None, mode: str = "workspace_only"):
         import copy
+        self._mode = mode
         self._matrix = copy.deepcopy(matrix) if matrix is not None else copy.deepcopy(DEFAULT_PERMISSION_MATRIX)
         self._audit_log: list[AuditEntry] = []
         self._entry_counter = 0
+        self._apply_mode_restrictions()
+
+    def _apply_mode_restrictions(self) -> None:
+        """Apply mode-based restrictions to the permission matrix."""
+        if self._mode == "workspace_only":
+            # Remove external access permissions for non-supervisor roles
+            restricted_roles = {"Worker", "Executor", "Researcher", "Critic", "Verifier"}
+            for role in restricted_roles:
+                perms = self._matrix.get(role, set())
+                perms.discard("api_call")
+                perms.discard("web_search")
+                perms.discard("code_execute")
+        elif self._mode == "full_access":
+            pass  # No additional restrictions
 
     # ── 权限矩阵管理 ────────────────────────────────────────────────
 

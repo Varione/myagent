@@ -20,6 +20,11 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 
+class SecurityError(Exception):
+    """安全相关异常，表示操作因安全风险被拒绝。"""
+    pass
+
+
 class ToolCategory(Enum):
     """工具类别。"""
 
@@ -307,50 +312,23 @@ class ToolRegistry:
 
 def builtin_code_execute(args: dict) -> dict:
     """
-    内置代码执行（简化版沙箱）。
+    内置代码执行（已禁用）。
 
-    支持 Python 代码执行，限制：
-    - 禁止 import os, sys, subprocess, socket 等危险模块
-    - 仅允许纯计算和数据处理操作
+    WARNING: 此函数不再执行任何代码。原始实现使用 exec() 且无真正沙箱保护，
+    存在任意文件读写、环境变量泄露、宿主进程控制等严重安全风险。
+
+    如需启用，请使用独立的隔离容器或子进程方案：
+    - 非特权用户
+    - 只读根文件系统
+    - 临时工作目录
+    - 禁止网络
+    - CPU/内存/时间限制
     """
-    code = args.get("code", "")
-    timeout = args.get("timeout", 10)
-
-    # 安全检查：禁止危险导入
-    dangerous_imports = ["os", "sys", "subprocess", "socket", "shutil", "ctypes"]
-    for mod in dangerous_imports:
-        if re.search(rf"\bimport\s+{mod}\b", code) or re.search(rf"\bfrom\s+{mod}\b", code):
-            raise ValueError(f"Import of '{mod}' is not allowed in sandbox")
-
-    # 禁止危险函数调用
-    dangerous_funcs = ["exec(", "eval(", "__import__", "open("]
-    for func in dangerous_funcs:
-        if func in code and func != "open(":
-            raise ValueError(f"Use of '{func}' is not allowed in sandbox")
-
-    # 执行代码
-    local_ns = {}
-    stdout_output = []
-
-    class _CapturePrint:
-        def write(self, text):
-            if text.strip():
-                stdout_output.append(text)
-        def flush(self):
-            pass
-
-    import io
-    old_stdout = __import__("sys").stdout
-    __import__("sys").stdout = _CapturePrint()
-    try:
-        exec(code, {"__builtins__": __builtins__}, local_ns)
-    finally:
-        __import__("sys").stdout = old_stdout
-
-    return {
-        "stdout": "".join(stdout_output).strip(),
-        "variables": {k: str(v)[:200] for k, v in local_ns.items() if not k.startswith("_")},
-    }
+    raise SecurityError(
+        "code_execute is disabled by default. "
+        "The built-in sandbox (exec with __builtins__) provides NO real security. "
+        "Use an isolated container or subprocess with seccomp/AppArmor for code execution."
+    )
 
 
 def builtin_file_parse(args: dict) -> dict:
@@ -420,17 +398,8 @@ def builtin_database_query(args: dict) -> dict:
 # ── 默认工具注册表工厂 ───────────────────────────────────────────────
 
 def create_default_tool_registry() -> ToolRegistry:
-    """创建包含内置工具的默认注册表。"""
+    """创建包含内置工具的默认注册表（不含 code_execute）。"""
     registry = ToolRegistry()
-
-    registry.register(
-        "code_execute",
-        builtin_code_execute,
-        description="在沙箱中执行 Python 代码",
-        category=ToolCategory.CODE_EXEC,
-        safety_level=ToolSafetyLevel.RISKY,
-        allowed_roles=["Executor", "Verifier", "Supervisor"],
-    )
 
     registry.register(
         "file_parse",
@@ -460,3 +429,20 @@ def create_default_tool_registry() -> ToolRegistry:
     )
 
     return registry
+
+
+def enable_code_execute(registry: ToolRegistry) -> None:
+    """
+    显式启用 code_execute（不推荐）。
+
+    WARNING: builtin_code_execute 当前会直接抛出 SecurityError。
+    如需真正启用，请替换 handler 为隔离容器或子进程实现。
+    """
+    registry.register(
+        "code_execute",
+        builtin_code_execute,
+        description="在沙箱中执行 Python 代码（已禁用）",
+        category=ToolCategory.CODE_EXEC,
+        safety_level=ToolSafetyLevel.CRITICAL,
+        allowed_roles=["Executor", "Verifier", "Supervisor"],
+    )
