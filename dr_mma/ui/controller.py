@@ -27,7 +27,8 @@ DEFAULT_MODEL_NAME = "Mock Model (Test)"
 class WorkflowController:
     """Owns workflow runtime state and desktop-facing callbacks."""
 
-    def __init__(self):
+    def __init__(self, tk_root=None):
+        self._tk_root = tk_root
         self._engine: Optional[WorkflowEngine] = None
         self._worker: Optional[threading.Thread] = None
         self._last_result: Optional[WorkflowResult] = None
@@ -49,7 +50,7 @@ class WorkflowController:
             "models": {},
             "language": ZH_CN,
             "workspace_root": "",
-            "allowed_tools": [],
+            "allowed_tools": None,
             "permission_mode": "workspace_only",
             "assignment_mode": "primary_preferred",
             "timeout_seconds": 120,
@@ -108,11 +109,11 @@ class WorkflowController:
             self.save_config()
 
     def save_config(self):
-        """Persist registered models and storage paths."""
+        """Persist registered models and storage paths (api_keys excluded)."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "language": self.language,
-            "models": self._model_infos,
+            "models": self._sanitize_model_infos(self._model_infos),
             "paths": {
                 key: self.config[key]
                 for key in ("blackboard_path", "artifact_path", "decision_path")
@@ -120,7 +121,7 @@ class WorkflowController:
             },
             "runtime": {
                 "workspace_root": self.config.get("workspace_root", ""),
-                "allowed_tools": list(self.config.get("allowed_tools", [])),
+                "allowed_tools": self.config.get("allowed_tools"),
                 "permission_mode": self.config.get("permission_mode", "workspace_only"),
                 "assignment_mode": self.config.get("assignment_mode", "primary_preferred"),
                 "timeout_seconds": int(self.config.get("timeout_seconds", 120) or 120),
@@ -139,20 +140,23 @@ class WorkflowController:
         model_name: str = "",
         model_type: str = "mock",
     ):
-        """Register a model instance and persist its definition."""
+        """Register a model instance and persist its definition (api_key excluded from persistence)."""
         info = {"name": name, "type": model_type}
         if endpoint:
             info["endpoint"] = endpoint
-        if api_key:
-            info["api_key"] = api_key
+        # Never persist api_key to disk; keep only in runtime memory
         if model_name:
             info["model_name"] = model_name
 
-        model = self._build_model_from_info(info)
+        model = self._build_model_from_info({**info, "api_key": api_key})
         self._model_adapter.register(name, model)
         self._model_infos = [item for item in self._model_infos if item.get("name") != name]
         self._model_infos.append(info)
         self.save_config()
+
+    def _sanitize_model_infos(self, infos: list[dict]) -> list[dict]:
+        """Remove api_key from model info dicts before persistence."""
+        return [{k: v for k, v in info.items() if k != "api_key"} for info in infos]
 
     def remove_model(self, name: str):
         """Remove a model registration and rebuild the adapter."""
@@ -172,7 +176,8 @@ class WorkflowController:
         return models or [DEFAULT_MODEL_NAME]
 
     def get_model_infos(self) -> list[dict]:
-        return list(self._model_infos)
+        """Return model infos without api_key values."""
+        return self._sanitize_model_infos(self._model_infos)
 
     def build_engine(self, model_name: str) -> WorkflowEngine:
         """Create a workflow engine with configured storage backends."""
@@ -207,7 +212,7 @@ class WorkflowController:
             "log_file": str(RUNTIME_LOG_FILE),
             "runtime_config": {
                 "workspace_root": self.config.get("workspace_root", ""),
-                "allowed_tools": list(self.config.get("allowed_tools", [])),
+                "allowed_tools": list(self.config.get("allowed_tools")) if self.config.get("allowed_tools") else None,
                 "permission_mode": self.config.get("permission_mode", "workspace_only"),
                 "assignment_mode": self.config.get("assignment_mode", "primary_preferred"),
                 "timeout_seconds": int(self.config.get("timeout_seconds", 120) or 120),
@@ -317,11 +322,12 @@ class WorkflowController:
             if "Mock" in model_name:
                 self._setup_mock_responses(model_name, task_text)
 
-            # Subscribe to streaming session via callback
-            if engine.stream_session:
-                engine.stream_session.on_event(self._on_stream_event)
+            # Create streaming session BEFORE execute so callbacks can register
+            from ..engine.streaming import StreamSession
+            stream_session = StreamSession()
+            stream_session.on_event(self._on_stream_event)
 
-            result = engine.execute(task_text, model_name)
+            result = engine.execute(task_text, model_name, stream_session=stream_session, cancel_token=self._cancel_flag)
             self._last_result = result
             self._log(
                 self.t(
@@ -472,6 +478,9 @@ class WorkflowController:
         if self.on_log:
             self._app_safe_call(self.on_log, msg)
 
-    @staticmethod
-    def _app_safe_call(callback, *args):
-        callback(*args)
+    def _app_safe_call(self, callback, *args):
+        """Call callback safely on the Tk main thread."""
+        if self._tk_root is not None:
+            self._tk_root.after(0, callback, *args)
+        else:
+            callback(*args)

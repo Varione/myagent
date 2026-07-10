@@ -354,7 +354,8 @@ class ConfigPanel(ctk.CTkFrame):
         self._workspace_entry.delete(0, "end")
         self._workspace_entry.insert(0, self.controller.config.get("workspace_root", ""))
         self._tools_entry.delete(0, "end")
-        self._tools_entry.insert(0, ", ".join(self.controller.config.get("allowed_tools", [])))
+        tools_list = self.controller.config.get("allowed_tools") or []
+        self._tools_entry.insert(0, ", ".join(tools_list))
         self._timeout_entry.delete(0, "end")
         self._timeout_entry.insert(0, str(self.controller.config.get("timeout_seconds", 120)))
         self._on_type_change(self._type_var.get())
@@ -484,7 +485,8 @@ class ConfigPanel(ctk.CTkFrame):
         self._workspace_entry.delete(0, "end")
         self._workspace_entry.insert(0, self.controller.config.get("workspace_root", ""))
         self._tools_entry.delete(0, "end")
-        self._tools_entry.insert(0, ", ".join(self.controller.config.get("allowed_tools", [])))
+        tools_list = self.controller.config.get("allowed_tools") or []
+        self._tools_entry.insert(0, ", ".join(tools_list))
         self._timeout_entry.delete(0, "end")
         self._timeout_entry.insert(0, str(self.controller.config.get("timeout_seconds", 120)))
         self._permission_var.set(self.controller.config.get("permission_mode", "workspace_only"))

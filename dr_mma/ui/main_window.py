@@ -24,7 +24,7 @@ class MainWindow(ctk.CTk):
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
-        self.controller = WorkflowController()
+        self.controller = WorkflowController(tk_root=self)
         self.chat_panel: ChatPanel | None = None
         self.pipeline_panel: PipelinePanel | None = None
         self.results_panel: ResultsPanel | None = None
