@@ -9,6 +9,8 @@ a quick health check.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import http.client
+import socket
 import time
 from typing import Optional
 
@@ -166,9 +168,82 @@ class ModelPool:
 
         return entry
 
+    @staticmethod
+    def _probe_endpoint(entry: ModelEntry) -> tuple[bool, str]:
+        """
+        Probe a model endpoint based on its type.
+
+        Returns:
+            (success, error_message)
+        """
+        provider = entry.provider.lower()
+
+        # Mock / in-memory models are always healthy
+        if provider in ("mock", "in_memory", "memory"):
+            return True, ""
+
+        endpoint = entry.endpoint.strip()
+        if not endpoint:
+            return False, "endpoint is empty"
+
+        # Local process: check TCP port connectivity
+        if provider in ("local", "local_process", "ollama", "lm_studio"):
+            try:
+                host_port = endpoint.replace("http://", "").replace("https://", "")
+                if "/" in host_port:
+                    host_port = host_port.split("/")[0]
+                host, port_str = host_port.rsplit(":", 1)
+                port = int(port_str)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(3.0)
+                    s.connect((host, port))
+                return True, ""
+            except Exception as e:
+                return False, f"local_connection_failed: {e}"
+
+        # Remote HTTP: send lightweight HEAD request
+        if provider in ("remote", "remote_http", "openai", "anthropic", "azure"):
+            try:
+                parsed = endpoint.split("/v")[0].split("/chat")[0].split("/completions")[0]
+                scheme = "https" if parsed.startswith("https") else "http"
+                host_port = parsed.replace("https://", "").replace("http://", "")
+                if "/" in host_port:
+                    host, path = host_port.split("/", 1)
+                    path = "/" + path
+                else:
+                    host = host_port
+                    path = "/v1/models"
+
+                if scheme == "https":
+                    conn = http.client.HTTPSConnection(host, timeout=5)
+                else:
+                    conn = http.client.HTTPConnection(host, timeout=5)
+                try:
+                    headers = {}
+                    if entry.api_key:
+                        headers["Authorization"] = f"Bearer {entry.api_key[:8]}..."
+                    conn.request("HEAD", path, headers=headers)
+                    resp = conn.getresponse()
+                    # 2xx and 4xx are acceptable (401 means endpoint reachable but key invalid)
+                    if resp.status in (200, 204, 400, 401, 403):
+                        return True, ""
+                    return False, f"http_{resp.status}"
+                finally:
+                    conn.close()
+            except Exception as e:
+                return False, f"http_probe_failed: {e}"
+
+        # Unknown provider: fall back to endpoint existence check
+        return bool(endpoint), ""
+
     def health_check_all(self) -> dict[str, str]:
         """
-        Run health checks on all models that need one.
+        Run real health checks on all models that need one.
+
+        Probes based on provider type:
+        - mock/in_memory: always healthy
+        - local/local_process: TCP port check
+        - remote/remote_http: HTTP HEAD request
 
         Returns:
             Mapping of model_id → status after check.
@@ -178,9 +253,8 @@ class ModelPool:
             if not entry.needs_health_check:
                 results[entry.model_id] = entry.status
                 continue
-            # Default: assume healthy unless endpoint is empty
-            success = bool(entry.endpoint)
-            self.health_check(entry.model_id, success=success)
+            success, error_msg = self._probe_endpoint(entry)
+            self.health_check(entry.model_id, success=success, error_message=error_msg)
             results[entry.model_id] = entry.status
         return results
 
