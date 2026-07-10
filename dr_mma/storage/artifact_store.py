@@ -80,7 +80,9 @@ class ArtifactStore:
             # If given a directory, create a default database file inside it
             if self._db_path.is_dir():
                 self._db_path = self._db_path / "artifact_store.db"
-        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_CREATE_TABLE)
         self._conn.commit()

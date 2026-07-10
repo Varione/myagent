@@ -7,6 +7,7 @@ DecisionLog — 决策记录 (SQLite)
 
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone
@@ -78,7 +79,9 @@ class DecisionLog:
     def __init__(self, db_path: str | Path):
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_CREATE_TABLE)
         self._conn.commit()
@@ -112,7 +115,7 @@ class DecisionLog:
             context: dict = None) -> DecisionRecord:
         """记录一条决策"""
         record = DecisionRecord(task_id, decision, rationale, context)
-        record.record_id = f"D-{int(datetime.now(timezone.utc).timestamp() * 1000000)}"
+        record.record_id = f"D-{uuid.uuid4().hex}"
         context_json = json.dumps(record.context, ensure_ascii=False)
         self._conn.execute(
             "INSERT INTO decision_log (record_id, task_id, decision, rationale, context, timestamp) "
