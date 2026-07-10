@@ -267,42 +267,52 @@ class TestToolExecutionRecord:
 class TestDefaultRegistryIntegration:
     """Test with actual default tool registry."""
 
-    def test_code_execute_safe(self):
+    def test_code_execute_not_in_default_registry(self):
+        """code_execute is not registered by default."""
         registry = create_default_tool_registry()
-        perm = PermissionManager()
+        assert not registry.tool_exists("code_execute")
+
+    def test_code_execute_blocked_when_not_registered(self):
+        """Tool executor blocks code_execute when not in registry."""
+        registry = create_default_tool_registry()
+        perm = PermissionManager(mode="full_access")
         executor = ToolExecutor(registry, perm)
 
         response = AgentResponse(
             task_id="T1",
-            role="Executor",
+            role="Supervisor",
             tool_calls=[
                 ToolCall(
                     tool_name="code_execute",
-                    args={"code": "x = 1 + 2\nprint(x)"},
+                    args={"code": "x = 1 + 2"},
                 )
             ],
         )
-        records = executor.execute_calls(response, role="Executor", task_id="T1")
+        records = executor.execute_calls(response, role="Supervisor", task_id="T1")
         assert len(records) == 1
-        assert records[0].result.success is True
-        assert "3" in str(records[0].result.output)
+        assert records[0].permission_allowed is False
+        # Either blocked by permission (critical needs human) or not registered
+        assert "not registered" in records[0].permission_reason or "human" in records[0].permission_reason.lower()
 
-    def test_code_execute_dangerous_import_blocked(self):
+    def test_web_search_works_with_approval(self):
+        """web_search works with supervisor approval."""
         registry = create_default_tool_registry()
-        perm = PermissionManager()
+        perm = PermissionManager(mode="full_access")
         executor = ToolExecutor(registry, perm)
 
         response = AgentResponse(
             task_id="T1",
-            role="Executor",
+            role="Researcher",
             tool_calls=[
                 ToolCall(
-                    tool_name="code_execute",
-                    args={"code": "import os\nos.system('rm -rf /')"},
+                    tool_name="web_search",
+                    args={"query": "test"},
                 )
             ],
         )
-        records = executor.execute_calls(response, role="Executor", task_id="T1")
+        records = executor.execute_calls(response, role="Researcher", task_id="T1")
         assert len(records) == 1
-        assert records[0].result.success is False
-        assert "not allowed" in records[0].result.error.lower()
+        # web_search is RISKY, needs supervisor approval
+        assert records[0].permission_allowed is False
+        assert records[0].action_level == "risky"
+        assert records[0].result is None  # Not executed due to permission denial

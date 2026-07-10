@@ -7,11 +7,13 @@ from dr_mma.engine.tools import (
     ToolResult,
     ToolCategory,
     ToolSafetyLevel,
+    SecurityError,
     builtin_code_execute,
     builtin_file_parse,
     builtin_web_search,
     builtin_database_query,
     create_default_tool_registry,
+    enable_code_execute,
 )
 
 
@@ -145,21 +147,16 @@ class TestUsageSummary:
 
 
 class TestBuiltinCodeExecute:
-    def test_simple_code(self):
-        r = builtin_code_execute({"code": "x = 1 + 2"})
-        assert r["variables"]["x"] == "3"
+    def test_disabled_by_default(self):
+        """code_execute raises SecurityError when called."""
+        with pytest.raises(SecurityError, match="disabled"):
+            builtin_code_execute({"code": "x = 1 + 2"})
 
-    def test_print_capture(self):
-        r = builtin_code_execute({"code": "print('hello')"})
-        assert "hello" in r["stdout"]
-
-    def test_forbidden_import(self):
-        with pytest.raises(ValueError, match="not allowed"):
-            builtin_code_execute({"code": "import os"})
-
-    def test_forbidden_exec(self):
-        with pytest.raises(ValueError, match="not allowed"):
-            builtin_code_execute({"code": "exec('x=1')"})
+    def test_error_message_informative(self):
+        """SecurityError message explains why it's disabled."""
+        with pytest.raises(SecurityError) as exc_info:
+            builtin_code_execute({"code": "print(1)"})
+        assert "sandbox" in str(exc_info.value).lower() or "security" in str(exc_info.value).lower()
 
 
 class TestBuiltinFileParse:
@@ -213,17 +210,22 @@ class TestBuiltinDatabaseQuery:
 class TestDefaultRegistry:
     def test_default_tools_registered(self):
         reg = create_default_tool_registry()
-        assert reg.tool_exists("code_execute")
+        assert not reg.tool_exists("code_execute")
         assert reg.tool_exists("file_parse")
         assert reg.tool_exists("web_search")
         assert reg.tool_exists("database_query")
 
-    def test_code_execute_restricted_roles(self):
+    def test_code_execute_not_in_default(self):
+        """code_execute is disabled by default for security."""
         reg = create_default_tool_registry()
-        r = reg.call("code_execute", {"code": "1+1"}, role="Critic")
-        assert r.success is False
+        assert not reg.tool_exists("code_execute")
 
-    def test_code_execute_allowed_for_executor(self):
+    def test_code_execute_can_be_enabled(self):
+        """code_execute can be explicitly enabled via enable_code_execute()."""
         reg = create_default_tool_registry()
-        r = reg.call("code_execute", {"code": "x=1"}, role="Executor")
-        assert r.success is True
+        enable_code_execute(reg)
+        assert reg.tool_exists("code_execute")
+        # But it still raises SecurityError when called
+        r = reg.call("code_execute", {"code": "1+1"}, role="Executor")
+        assert r.success is False
+        assert "disabled" in r.error.lower() or "security" in r.error.lower()

@@ -207,6 +207,16 @@ class EventBus:
         """Convenience alias for get_history with session scope"""
         return self.get_history(session_id=session_id, after_id=after_id)
 
+    # -- Query (for workflow compatibility) --
+
+    def query(self, event_type: str = "", session_id: str = "") -> list[SessionEvent]:
+        """Query events by type and/or session_id."""
+        return self.get_history(session_id=session_id, event_type=event_type)
+
+    def all_events(self) -> list[SessionEvent]:
+        """Return all events."""
+        return list(self._events)
+
     # -- Stats --
 
     def event_count(self, session_id: str = "") -> int:

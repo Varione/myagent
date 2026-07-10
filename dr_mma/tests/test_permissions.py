@@ -54,7 +54,12 @@ class TestActionLevels:
     def test_safe_actions(self):
         pm = PermissionManager()
         assert pm.is_safe_action("blackboard_read") is True
-        assert pm.is_safe_action("code_execute") is True
+        assert pm.is_safe_action("database_query") is True
+
+    def test_code_execute_is_critical(self):
+        """code_execute is CRITICAL and requires human approval."""
+        pm = PermissionManager()
+        assert pm.is_critical_action("code_execute") is True
 
     def test_risky_actions(self):
         pm = PermissionManager()
@@ -73,7 +78,7 @@ class TestActionLevels:
 
 class TestPermissionCheck:
     def _setup(self):
-        return PermissionManager()
+        return PermissionManager(mode="full_access")
 
     def test_safe_action_allowed(self):
         pm = self._setup()
@@ -194,22 +199,33 @@ class TestPermissionMatrixDefaults:
     """验证架构计划中定义的权限矩阵。"""
 
     def _setup(self):
-        return PermissionManager()
+        return PermissionManager(mode="full_access")
 
     def test_planner_cannot_modify_dag(self):
         pm = self._setup()
         r = pm.check("Planner", "modify_dag")
         assert r.allowed is False
 
-    def test_executor_can_code_execute(self):
+    def test_executor_can_code_execute_full_access(self):
+        """In full_access mode, executor can request code_execute (but needs human approval)."""
         pm = self._setup()
         r = pm.check("Executor", "code_execute")
-        assert r.allowed is True
+        # code_execute is CRITICAL, so requires human approval even if role has permission
+        assert r.requires_approval == "human"
 
-    def test_researcher_can_web_search(self):
+    def test_researcher_can_web_search_full_access(self):
+        """In full_access mode, researcher can request web_search (needs supervisor approval)."""
         pm = self._setup()
         r = pm.check("Researcher", "web_search")
         assert r.requires_approval == "supervisor"
+
+    def test_workspace_only_restricts_external_access(self):
+        """In workspace_only mode, non-supervisor roles lose external access."""
+        pm = PermissionManager(mode="workspace_only")
+        r = pm.check("Executor", "code_execute")
+        assert r.allowed is False
+        r = pm.check("Researcher", "web_search")
+        assert r.allowed is False
 
     def test_verifier_can_database_query(self):
         pm = self._setup()
