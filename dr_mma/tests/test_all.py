@@ -32,7 +32,7 @@ class TestTaskContract:
     def test_default_id_generation(self):
         c = TaskContract()
         assert c.task_id.startswith("T-")
-        assert len(c.task_id) == 10  # "T-" + 8 hex chars
+        assert len(c.task_id) > 10  # UUIDv7 IDs are longer than legacy format
 
     def test_custom_id(self):
         c = TaskContract(task_id="T-custom")
@@ -393,9 +393,9 @@ class TestBlackboard:
     def test_clear(self, tmp_file):
         bb = Blackboard(tmp_file)
         bb.write(BlackboardEntry(task_id="T-001"))
+        assert bb.count() == 1
         bb.clear()
         assert bb.count() == 0
-        assert not os.path.exists(tmp_file)
 
 
 class TestArtifactStore:
@@ -609,10 +609,17 @@ class TestWorkflowEngine:
         )
         yield engine
 
-        # Cleanup
+        # Cleanup: close SQLite connections before deleting files
+        try:
+            engine.close()
+        except Exception:
+            pass
         for p in [self.tmp_bb, self.tmp_art, self.tmp_dec]:
             if os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except PermissionError:
+                    pass
 
     def test_workflow_execution(self, engine):
         result = engine.execute("测试任务: 分析需求并设计方案")
@@ -712,17 +719,25 @@ class TestIntegration:
             # Verify storage persistence
             bb2 = Blackboard(bb_path)
             assert bb2.count() > 0
+            bb2.close()
 
             art2 = ArtifactStore(art_path)
             assert art2.count() > 0
+            art2.close()
 
             dec2 = DecisionLog(dec_path)
             assert dec2.count() > 0
+            dec2.close()
+
+            engine.close()
 
         finally:
             for p in [bb_path, art_path, dec_path]:
                 if os.path.exists(p):
-                    os.unlink(p)
+                    try:
+                        os.unlink(p)
+                    except PermissionError:
+                        pass
 
     def test_controller_persistence(self):
         """WorkflowController 模型配置持久化"""

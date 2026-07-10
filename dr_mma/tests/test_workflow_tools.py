@@ -64,9 +64,10 @@ class TestWorkflowToolExecutorSetup:
 
     def test_default_tools_registered(self):
         engine, _, _ = _make_engine_with_mock()
-        assert engine.tool_registry.tool_count >= 4
-        assert engine.tool_registry.tool_exists("code_execute")
+        assert engine.tool_registry.tool_count >= 3
+        assert not engine.tool_registry.tool_exists("code_execute")
         assert engine.tool_registry.tool_exists("file_parse")
+        assert engine.tool_registry.tool_exists("web_search")
 
     def test_permission_manager_initialized(self):
         engine, _, _ = _make_engine_with_mock()
@@ -90,12 +91,12 @@ class TestWorkflowDirectModeWithTools:
     def test_direct_mode_with_tool_calls(self):
         responses = {
             "直接执行": (
-                '{"status": "completed", "summary": "computed", "content": "Result: 3", '
-                '"tool_calls": [{"tool_name": "code_execute", "args": {"code": "print(1+2)"}}]}'
+                '{"status": "completed", "summary": "searched", "content": "Result: found", '
+                '"tool_calls": [{"tool_name": "web_search", "args": {"query": "test query"}}]}'
             ),
         }
         engine, _, _ = _make_engine_with_mock(responses=responses)
-        result = engine.execute("简单计算")
+        result = engine.execute("简单搜索")
         assert result.status == "completed"
         audit = engine.tool_executor.audit_summary()
         assert audit["total_calls"] >= 1
@@ -108,15 +109,15 @@ class TestWorkflowToolEventPublishing:
         responses = {
             "直接执行": (
                 '{"status": "completed", "summary": "done", "content": "ok", '
-                '"tool_calls": [{"tool_name": "code_execute", "args": {"code": "1+1"}}]}'
+                '"tool_calls": [{"tool_name": "web_search", "args": {"query": "test"}}]}'
             ),
         }
         engine, _, _ = _make_engine_with_mock(responses=responses)
-        result = engine.execute("简单计算")
+        result = engine.execute("简单搜索")
         events = engine.event_bus.all_events()
         tool_events = [e for e in events if e.event_type == "TOOL_EXECUTED"]
         assert len(tool_events) >= 1
-        assert tool_events[0].payload.get("tool_name") == "code_execute"
+        assert tool_events[0].payload.get("tool_name") == "web_search"
 
 
 class TestWorkflowToolAllowedList:
@@ -127,19 +128,19 @@ class TestWorkflowToolAllowedList:
             "直接执行": (
                 '{"status": "completed", "summary": "done", "content": "ok", '
                 '"tool_calls": ['
-                '  {"tool_name": "code_execute", "args": {"code": "1"}},'
-                '  {"tool_name": "web_search", "args": {"query": "x"}}'
+                '  {"tool_name": "web_search", "args": {"query": "x"}},'
+                '  {"tool_name": "database_query", "args": {"sql": "SELECT 1"}}'
                 ']}'
             ),
         }
         engine, _, _ = _make_engine_with_mock(responses=responses)
-        engine.runtime_config["allowed_tools"] = ["code_execute"]
+        engine.runtime_config["allowed_tools"] = ["web_search"]
         result = engine.execute("简单问题")
         assert result.status == "completed"
         records = engine.tool_executor.get_records_dict()
-        web_search_records = [r for r in records if r["tool_name"] == "web_search"]
-        assert len(web_search_records) >= 1
-        assert web_search_records[0]["permission_allowed"] is False
+        db_records = [r for r in records if r["tool_name"] == "database_query"]
+        assert len(db_records) >= 1
+        assert db_records[0]["permission_allowed"] is False
 
 
 class TestWorkflowPermissionIntegration:
