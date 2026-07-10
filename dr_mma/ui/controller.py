@@ -190,7 +190,7 @@ class WorkflowController:
             main_model=model_name,
             runtime_config={
                 "workspace_root": self.config.get("workspace_root", ""),
-                "allowed_tools": list(self.config.get("allowed_tools", [])),
+                "allowed_tools": tuple(self.config["allowed_tools"]) if self.config.get("allowed_tools") is not None else None,
                 "permission_mode": self.config.get("permission_mode", "workspace_only"),
                 "assignment_mode": self.config.get("assignment_mode", "primary_preferred"),
                 "timeout_seconds": int(self.config.get("timeout_seconds", 120) or 120),

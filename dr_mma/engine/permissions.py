@@ -34,7 +34,14 @@ DEFAULT_PERMISSION_MATRIX: dict[str, set[str]] = {
         "blackboard_write",
         "read_artifact",
     },
-    "Executor": {
+    "Worker": {
+        "blackboard_read",
+        "blackboard_write",
+        "read_artifact",
+        "code_execute",
+        "api_call",
+    },
+    "Executor": {  # alias for Worker
         "blackboard_read",
         "blackboard_write",
         "read_artifact",
@@ -42,6 +49,14 @@ DEFAULT_PERMISSION_MATRIX: dict[str, set[str]] = {
         "api_call",
     },
     "Researcher": {
+        "blackboard_read",
+        "blackboard_write",
+        "read_artifact",
+        "web_search",
+        "file_parse",
+        "database_query",
+    },
+    "Domain Expert": {
         "blackboard_read",
         "blackboard_write",
         "read_artifact",
