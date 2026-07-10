@@ -9,7 +9,7 @@ UUIDv7 generates time-sortable unique identifiers:
 UUIDs generated within the same millisecond use an incrementing counter
 in the lower bits to guarantee monotonic order.
 
-All entity IDs follow the pattern: PREFIX-TIMESTAMP_RANDOM_HEX
+All entity IDs follow the pattern: PREFIX-UUIDv7_HEX
 This ensures lexicographic sorting matches chronological order.
 """
 
@@ -17,7 +17,6 @@ import os
 import threading
 import time
 import uuid
-from typing import Optional
 
 
 # ── Monotonic UUIDv7 with thread-safe counter ───────────────────────────────
@@ -91,16 +90,7 @@ def uuid7_str() -> str:
     return str(uuid7())
 
 
-# ── Timestamp (sortable) ────────────────────────────────────────────────────
-
-def _timestamp_prefix() -> str:
-    """
-    Return a 12-character hex timestamp prefix (48 bits = milliseconds).
-    This ensures lexicographic sorting matches chronological order.
-    """
-    ts = int(time.time() * 1000)
-    return f"{ts:012x}"
-
+# ── Random suffix helper ───────────────────────────────────────────────────
 
 def _random_suffix(length: int = 8) -> str:
     """Return a random hex suffix of given length."""
@@ -109,37 +99,37 @@ def _random_suffix(length: int = 8) -> str:
 
 # ── Prefixed Entity IDs ────────────────────────────────────────────────────
 
-def make_id(prefix: str = "ID", hex_length: int = 16) -> str:
+def make_id(prefix: str = "ID", hex_length: int = 32) -> str:
     """
     Generate a time-sortable prefixed ID.
     
-    Format: {PREFIX}-{TIMESTAMP_HEX}_{UUIDv7_HEX[:hex_len]}
-    Example: SES-0000018a5b3f_a1b2c3d4
+    Format: {PREFIX}-{UUIDv7_HEX[:hex_len]}
+    Example: SES-0000018a5b3fa1b2c3d4e5f6
     
-    Uses UUIDv7 internally so IDs are strictly monotonic even within
-    the same millisecond. Sorting alphabetically == sorting chronologically.
+    UUIDv7 hex already contains the timestamp in its first 12 characters,
+    so no separate timestamp prefix is needed. IDs are strictly monotonic
+    even within the same millisecond. Sorting alphabetically == sorting
+    chronologically.
     
     Args:
         prefix: Entity type prefix (e.g. "SES", "MSG", "TASK", "ART")
-        hex_length: Total hex chars after prefix (default 16 = 64 bits)
+        hex_length: Hex chars after prefix (default 32 = full UUIDv7)
     
     Returns:
         Prefixed ID string
     """
-    ts = _timestamp_prefix()
     uid_hex = uuid7_hex()
     max_hex = min(hex_length, 32)
-    rand_part = uid_hex[:max_hex]
-    return f"{prefix}-{ts}_{rand_part}"
+    return f"{prefix}-{uid_hex[:max_hex]}"
 
 
 def make_short_id(prefix: str = "ID") -> str:
-    """Generate a compact time-sortable ID (28 chars total)."""
+    """Generate a compact time-sortable ID (20 chars total)."""
     return make_id(prefix, hex_length=16)
 
 
 def make_long_id(prefix: str = "ID") -> str:
-    """Generate a full UUIDv7-based prefixed ID (41 chars total)."""
+    """Generate a full UUIDv7-based prefixed ID (37 chars total)."""
     return f"{prefix}-{uuid7_hex()}"
 
 
@@ -147,8 +137,14 @@ def make_long_id(prefix: str = "ID") -> str:
 
 def is_legacy_id(entity_id: str) -> bool:
     """
-    Check if an ID uses the legacy format (PREFIX-{uuid4_hex[:8]}).
-    Legacy: SES-a1b2c3d4 (prefix + 8 hex chars, no underscore)
-    New:    SES-0000018a5b3f_a1b2c3d4 (prefix + timestamp + underscore + random)
+    Check if an ID uses the legacy format.
+    
+    Legacy short: PREFIX-XXXXXXXX (prefix + 8 hex chars, no UUIDv7 structure)
+    New format:   PREFIX-{32 hex chars of UUIDv7}
+    
+    Detects legacy by checking hex part length < 24 (new is always 32).
     """
-    return "_" not in entity_id
+    if "-" not in entity_id:
+        return True
+    hex_part = entity_id.split("-", 1)[1]
+    return len(hex_part) < 24

@@ -52,8 +52,8 @@ class TestMakeID:
         before = int(time.time() * 1000)
         iid = make_id("T")
         after = int(time.time() * 1000)
-        # Extract timestamp hex part
-        ts_hex = iid.split("-")[1].split("_")[0]
+        # UUIDv7 hex first 12 chars encode the timestamp (48 bits)
+        ts_hex = iid.split("-")[1][:12]
         ts = int(ts_hex, 16)
         assert before <= ts <= after + 100  # allow slight skew
 
@@ -76,13 +76,13 @@ class TestMakeID:
 
 
 class TestIsLegacyID:
-    def test_legacy_format_underscore(self):
+    def test_legacy_format_short(self):
         assert is_legacy_id("SES-a1b2c3d4")
         assert is_legacy_id("T-xyz7890")
 
-    def test_new_format_no_underscore(self):
-        assert not is_legacy_id("SES-0000018a5b3f_a1b2c3d4")
-        assert not is_legacy_id("TASK-0000018a5b3f_abc123")
+    def test_new_format_full_hex(self):
+        assert not is_legacy_id("SES-0000018a5b3fa1b2c3d4e5f6a7b8c9d0")
+        assert not is_legacy_id("TASK-0000018a5b3fa1b2c3d4e5f6a7b8c9d0")
 
     def test_empty_string(self):
         assert is_legacy_id("")
