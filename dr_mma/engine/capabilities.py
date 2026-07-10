@@ -1,6 +1,9 @@
 """Capability registry and dynamic role assignment."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+import time
 from typing import Optional
 
 
@@ -13,6 +16,9 @@ ROLE_CAPABILITIES = {
     "Critic": ["critic", "reasoning"],
     "Verifier": ["verification", "reasoning"],
     "Synthesizer": ["synthesis", "writing"],
+    # High-overlap role pairs for merge testing
+    "Senior Supervisor": ["reasoning", "synthesis", "decision", "planning"],
+    "Junior Supervisor": ["reasoning", "synthesis", "decision", "coordination"],
 }
 
 
@@ -28,6 +34,13 @@ class CapabilityProfile:
     cost_score: float = 0.8
     tool_score: float = 0.8
     capabilities: dict[str, float] = field(default_factory=dict)
+
+    # Phase 2 fields — confidence, sample_count, failure_count, etc.
+    confidence: float = 0.5
+    sample_count: int = 0
+    failure_count: int = 0
+    last_evaluated_at: Optional[float] = None
+    update_source: str = "default"  # benchmark | history | feedback | default
 
     @property
     def calibrated_score(self) -> float:

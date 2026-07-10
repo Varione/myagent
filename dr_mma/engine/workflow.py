@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import time
 from typing import Optional
 
 from ..models.adapter import ChatMessage, ModelAdapter
@@ -31,6 +32,8 @@ from .events import (
     EVENT_WORKFLOW_MODE,
     EventBus,
 )
+from .model_pool import ModelPool
+from .role_manager import RoleBinding, RoleMergerSplitter
 
 
 @dataclass
@@ -62,6 +65,7 @@ class WorkflowEngine:
         decision_log: DecisionLog,
         main_model: str = "",
         runtime_config: Optional[dict] = None,
+        model_pool: Optional[ModelPool] = None,
     ):
         self.adapter = adapter
         self.blackboard = blackboard
@@ -75,6 +79,13 @@ class WorkflowEngine:
         self.event_bus = EventBus()
         self.runtime_config = runtime_config or {}
 
+        # Phase 2: Model Pool & Role Manager
+        self.model_pool = model_pool or ModelPool()
+        self.role_manager = RoleMergerSplitter(
+            pool=self.model_pool,
+            registry=self.capability_registry,
+        )
+
     def execute(self, user_task: str, model_name: str = "", max_retries: int = 1) -> WorkflowResult:
         import time
 
@@ -82,6 +93,10 @@ class WorkflowEngine:
         primary_model = model_name or self.main_model
         if not primary_model:
             raise ValueError("必须指定模型名称")
+
+        # Phase 2: ensure all models are registered in the pool and health-checked
+        self._ensure_pool_populated(primary_model)
+        self.model_pool.health_check_all()
 
         result = WorkflowResult(task_id=f"WF-{hash(user_task) % 100000:05d}")
         result.runtime_config = dict(self.runtime_config)
@@ -173,6 +188,11 @@ class WorkflowEngine:
         if complexity.mode == MODE_EXPANDED:
             roles.extend(["Researcher", "Domain Expert"])
 
+        # Phase 2: use ModelPool for healthy model filtering
+        pool_healthy = [e.model_id for e in self.model_pool.healthy_models()]
+        if pool_healthy:
+            available_models = [m for m in available_models if m in pool_healthy] or available_models
+
         if assignment_mode == "single_model":
             assignments = {role: primary_model for role in roles}
         else:
@@ -183,6 +203,9 @@ class WorkflowEngine:
 
         if len(available_models) == 1:
             assignments = {role: primary_model for role in roles}
+
+        # Phase 2: apply RoleMergerSplitter merge/split/failover decisions
+        self._apply_role_manager_decisions(assignments, roles, complexity)
 
         for role, model in assignments.items():
             self.event_bus.publish(
@@ -493,6 +516,68 @@ class WorkflowEngine:
         self._record("Supervisor", contract, response)
         return response
 
+    # ── Phase 2 helpers ─────────────────────────────────────────────
+
+    def _ensure_pool_populated(self, primary_model: str) -> None:
+        """Ensure all known models are registered in the ModelPool."""
+        if self.model_pool.get(primary_model) is None:
+            self.model_pool.register(primary_model, name=primary_model, provider="local")
+
+        for model_name in (self.adapter.available_models or []):
+            if self.model_pool.get(model_name) is None:
+                self.model_pool.register(model_name, name=model_name, provider="local")
+
+    def _apply_role_manager_decisions(
+        self,
+        assignments: dict[str, str],
+        roles: list[str],
+        complexity: ComplexityReport,
+    ) -> None:
+        """Apply merge/split/failover decisions from RoleMergerSplitter."""
+        # Initialize bindings for each role
+        for role in roles:
+            model = assignments.get(role, self.main_model)
+            if not self.role_manager.get_binding(role):
+                self.role_manager.set_binding(
+                    RoleBinding(
+                        role=role,
+                        primary_model=model,
+                    )
+                )
+
+        # Attempt merges on adjacent roles when pool is small
+        if self.model_pool.healthy_count <= 2:
+            for i in range(len(roles) - 1):
+                role_a = roles[i]
+                role_b = roles[i + 1]
+                if assignments.get(role_a) != assignments.get(role_b):
+                    binding = self.role_manager.merge_roles(role_a, role_b)
+                    if binding:
+                        assignments[role_a] = binding.primary_model
+                        assignments[role_b] = binding.primary_model
+
+        # Attempt splits on heavily loaded roles when pool is large
+        if self.model_pool.healthy_count >= 4:
+            for role in roles:
+                if self.role_manager.should_split(role):
+                    self.role_manager.split_role(role)
+
+    def _record_model_call_success(self, model_id: str) -> None:
+        """Record a successful model call for health tracking."""
+        self.model_pool.record_call_success(model_id)
+
+    def _record_model_call_failure(self, model_id: str, error_message: str = "") -> None:
+        """Record a failed model call and trigger failover if needed."""
+        self.model_pool.record_call_failure(model_id, error_message)
+        affected = self.role_manager.handle_failover(model_id)
+        if affected:
+            self.decision_log.log(
+                task_id="failover",
+                decision="model_failover_triggered",
+                rationale=f"Model {model_id} failed, affected roles: {affected}",
+                context={"model_id": model_id, "affected_roles": affected},
+            )
+
     def _publish_replan_signal(self, workflow_id: str, subtask_id: str, response: AgentResponse, reason: str):
         event_type = EVENT_LOW_CONFIDENCE if response.status == "low_confidence" else EVENT_NEED_REPLAN
         event = self.event_bus.publish(
@@ -543,6 +628,13 @@ class WorkflowEngine:
             payload={"contract": contract.to_dict(), "response": response.to_dict()},
         )
         self.blackboard.write(entry)
+
+        # Phase 2: track model health per call
+        model_id = contract.assigned_model
+        if response.status in ("completed",):
+            self._record_model_call_success(model_id)
+        else:
+            self._record_model_call_failure(model_id, error_message=response.summary[:200])
 
     @staticmethod
     def _parse_subtasks(content: str) -> list[dict]:
