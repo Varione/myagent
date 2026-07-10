@@ -18,6 +18,7 @@ from .domain_agents import (
     DomainAgent,
     DomainRegistry,
 )
+from .id_utils import uuid7, uuid7_hex, make_id, make_short_id, make_long_id, is_legacy_id
 from .event_bus import SessionEvent, EventBus
 from .events import WorkflowEvent
 from .mcp_client import (

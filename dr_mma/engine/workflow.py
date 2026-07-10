@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import json
 import time
 from typing import Optional
 
 from ..models.adapter import ChatMessage, ModelAdapter
+import threading
 from ..roles.runner import RoleRunner
 from ..schemas.agent_response import AgentResponse
 from ..schemas.blackboard_entry import BlackboardEntry
@@ -38,6 +41,10 @@ from .permissions import PermissionManager
 from .role_manager import RoleBinding, RoleMergerSplitter
 from .tool_executor import ToolExecutor
 from .tools import ToolRegistry, create_default_tool_registry
+from .budget_controller import BudgetController
+from .context_manager import ContextManager
+from .observability import EventTracer, DAGGraph, DiagnosticsPanel, EventType as ObsEventType
+from .supervisor_modules import SupervisorOrchestrator
 
 
 @dataclass
@@ -92,20 +99,61 @@ class WorkflowEngine:
 
         # Tool execution: bridge ToolRegistry + PermissionManager
         self.tool_registry = create_default_tool_registry()
-        self.permission_manager = PermissionManager()
+        permission_mode = (runtime_config or {}).get("permission_mode", "workspace_only")
+        self.permission_manager = PermissionManager(mode=permission_mode)
         self.tool_executor = ToolExecutor(
             registry=self.tool_registry,
             permission_manager=self.permission_manager,
         )
 
+        # Phase 3: Budget, Context, Observability, Supervisor modules
+        self.budget_controller = BudgetController(
+            warning_threshold=float((runtime_config or {}).get("budget_warning_threshold", 0.8)),
+        )
+        self.context_manager = ContextManager(
+            max_runtime_tokens=int((runtime_config or {}).get("max_runtime_tokens", 40_000)),
+        )
+        self.event_tracer = EventTracer()
+        self.dag_graph = DAGGraph()
+        self.diagnostics_panel = DiagnosticsPanel(
+            tracer=self.event_tracer,
+            dag=self.dag_graph,
+            tool_registry=self.tool_registry,
+        )
+        self.supervisor = SupervisorOrchestrator()
+
         # Streaming session (set during execute())
         self.stream_session: Optional[StreamSession] = None
+        self._cancel_token: Optional[threading.Event] = None
+        self._current_workflow_id: str = ""
 
-    def execute(self, user_task: str, model_name: str = "", max_retries: int = 1) -> WorkflowResult:
+    def close(self):
+        """Close all storage backends (SQLite connections)."""
+        try:
+            self.blackboard.close()
+        except Exception:
+            pass
+        try:
+            self.artifact_store.close()
+        except Exception:
+            pass
+        try:
+            self.decision_log.close()
+        except Exception:
+            pass
+
+    def execute(
+        self,
+        user_task: str,
+        primary_model: str = "",
+        max_retries: int = 3,
+        stream_session: "StreamSession" = None,
+        cancel_token: threading.Event = None,
+    ) -> WorkflowResult:
         import time
 
         t0 = time.time()
-        primary_model = model_name or self.main_model
+        primary_model = primary_model or self.main_model
         if not primary_model:
             raise ValueError("必须指定模型名称")
 
@@ -115,15 +163,39 @@ class WorkflowEngine:
 
         result = WorkflowResult(task_id=f"WF-{hash(user_task) % 100000:05d}")
         result.runtime_config = dict(self.runtime_config)
+        self._current_workflow_id = result.task_id
 
-        # Create streaming session for this workflow execution
-        self.stream_session = StreamSession(stream_id=result.task_id)
+        # Use provided stream session or create one
+        self.stream_session = stream_session or StreamSession(stream_id=result.task_id)
+        self._cancel_token = cancel_token
+
+        # Phase 3: Initialize Budget, Context, Tracing
+        self.budget_controller.initialize(
+            task_id=result.task_id,
+            max_model_calls=int(self.runtime_config.get("max_model_calls", 30)),
+            max_tool_calls=int(self.runtime_config.get("max_tool_calls", 10)),
+            max_total_tokens=int(self.runtime_config.get("max_total_tokens", 120_000)),
+            max_retries_per_node=max_retries + 1,
+        )
+        self.context_manager.init_global_context(result.task_id)
+        self.event_tracer.record(
+            ObsEventType.TASK_CREATED,
+            task_id=result.task_id,
+            message=f"Workflow created: mode pending, complexity pending",
+        )
 
         complexity = self.complexity_evaluator.evaluate(user_task)
         assignments = self._assign_roles(primary_model, complexity)
         result.mode = complexity.mode
         result.complexity_score = complexity.score
         result.role_assignments = assignments
+
+        # Phase 3: Supervisor task understanding
+        understanding = self.supervisor.understanding.analyze(
+            task_id=result.task_id,
+            user_task=user_task,
+        )
+        self.context_manager.add_key_risk(result.task_id, f"risk_level={understanding.risk_level}")
 
         self.event_bus.publish(
             EVENT_WORKFLOW_MODE,
@@ -143,10 +215,27 @@ class WorkflowEngine:
 
         subtasks = self._plan_subtasks(result.task_id, user_task, assignments["Planner"], complexity)
         if not subtasks:
+            # Phase 3: Record failure in observability
+            self.event_tracer.record(
+                ObsEventType.TASK_FAILED,
+                task_id=result.task_id,
+                data={"mode": complexity.mode},
+                message="规划阶段未能生成有效子任务",
+            )
             result.status = "failed"
             result.final_output = "规划阶段未能生成有效子任务。"
             result.total_latency_ms = round((time.time() - t0) * 1000, 1)
             return result
+
+        # Phase 3: Supervisor DAG planning
+        dag_plan = self.supervisor.planning.plan(result.task_id, understanding, subtasks)
+        if dag_plan.nodes:
+            self.decision_log.log(
+                task_id=result.task_id,
+                decision="dag_planned",
+                rationale=f"DAG: {len(dag_plan.nodes)} nodes, {len(dag_plan.edges)} edges",
+                context={"plan": dag_plan.to_dict()},
+            )
 
         result.dag_nodes = [
             {
@@ -167,18 +256,42 @@ class WorkflowEngine:
             subtasks = subtasks[: min(len(subtasks), 5)]
         result.dag_nodes = result.dag_nodes[: len(subtasks)]
 
-        subtask_results = {}
-        for idx, subtask in enumerate(subtasks):
-            sub_id = f"{result.task_id}-T{idx:02d}"
-            subtask_results[sub_id] = self._execute_subtask(
-                workflow_id=result.task_id,
-                subtask_id=sub_id,
-                subtask=subtask,
-                assignments=assignments,
-                mode=complexity.mode,
-                max_retries=max_retries,
-            )
-            result.dag_nodes[idx]["status"] = self._derive_subtask_status(subtask_results[sub_id])
+        # Phase 3: Build DAG graph for observability
+        self.dag_graph = DAGGraph()
+        dep_map: dict[str, list[str]] = {}
+        for node in result.dag_nodes:
+            nid = node["task_id"]
+            self.dag_graph.add_node(nid, node["task_name"], role="Worker", status="pending")
+            dep_map[nid] = [d for d in node.get("depends_on", [])]
+        # Infer edges from depends_on task names → task_ids
+        id_by_name: dict[str, str] = {
+            node["task_name"]: node["task_id"] for node in result.dag_nodes
+        }
+        for nid, deps in dep_map.items():
+            for dep in deps:
+                target_id = id_by_name.get(dep) if isinstance(dep, str) else dep
+                if target_id and target_id in [n["task_id"] for n in result.dag_nodes]:
+                    self.dag_graph.add_edge(target_id, nid, label="depends_on")
+
+        self.event_tracer.record(
+            ObsEventType.TASK_STARTED,
+            task_id=result.task_id,
+            data={"mode": complexity.mode, "subtask_count": len(subtasks)},
+            message=f"Workflow started: {complexity.mode} with {len(subtasks)} subtasks",
+        )
+
+        subtask_results = self._execute_subtasks_dag(
+            result=result,
+            subtasks=subtasks,
+            assignments=assignments,
+            mode=complexity.mode,
+            max_retries=max_retries,
+            t0=t0,
+        )
+
+        # Check if DAG was cancelled
+        if result.status == "cancelled":
+            return result
 
         final_output = self._summarize(result.task_id, subtask_results, assignments["Supervisor"])
         result.subtask_results = subtask_results
@@ -195,11 +308,185 @@ class WorkflowEngine:
             context={"events": result.event_count, "mode": result.mode, "runtime": self.runtime_config},
         )
 
+        # Phase 3: Record completion in observability
+        status_tag = ObsEventType.TASK_COMPLETED if result.status == "completed" else ObsEventType.TASK_FAILED
+        self.event_tracer.record(
+            status_tag,
+            task_id=result.task_id,
+            duration_ms=result.total_latency_ms,
+            data={"status": result.status, "mode": result.mode},
+            message=f"Workflow {result.status} in {result.total_latency_ms}ms",
+        )
+
         # Close streaming session
         if self.stream_session and not self.stream_session.producer.is_closed:
             self.stream_session.close()
 
         return result
+
+    # ── DAG Subtask Execution ────────────────────────────────────────────
+
+    def _execute_subtasks_dag(
+        self,
+        result: WorkflowResult,
+        subtasks: list[dict],
+        assignments: dict[str, str],
+        mode: str,
+        max_retries: int,
+        t0: float,
+    ) -> dict[str, dict]:
+        """
+        Execute subtasks with true DAG scheduling.
+
+        Independent subtasks run in parallel via ThreadPoolExecutor.
+        Dependent subtasks wait for their dependencies to complete first.
+        Falls back to serial execution if the DAG has cycles.
+        """
+        n = len(subtasks)
+        if n == 0:
+            return {}
+
+        node_ids = [f"{result.task_id}-T{idx:02d}" for idx in range(n)]
+
+        # Map task_name → index for dependency resolution
+        name_to_idx: dict[str, int] = {}
+        for idx, sub in enumerate(subtasks):
+            name = sub.get("task_name", "")
+            if name:
+                name_to_idx[name] = idx
+
+        # Build adjacency and in-degree
+        in_degree = [0] * n
+        dependents: list[list[int]] = [[] for _ in range(n)]
+
+        for idx, sub in enumerate(subtasks):
+            deps = sub.get("depends_on", [])
+            for dep in deps:
+                if isinstance(dep, int) and 0 <= dep < n:
+                    dep_idx = dep
+                elif isinstance(dep, str) and dep in name_to_idx:
+                    dep_idx = name_to_idx[dep]
+                else:
+                    continue
+                if dep_idx != idx:
+                    in_degree[idx] += 1
+                    dependents[dep_idx].append(idx)
+
+        # Topological sort into layers
+        queue = deque([i for i in range(n) if in_degree[i] == 0])
+        layers: list[list[int]] = []
+        visited = 0
+
+        while queue:
+            current_layer = list(queue)
+            queue.clear()
+            layers.append(current_layer)
+            for node_idx in current_layer:
+                visited += 1
+                for dep_idx in dependents[node_idx]:
+                    in_degree[dep_idx] -= 1
+                    if in_degree[dep_idx] == 0:
+                        queue.append(dep_idx)
+
+        # Fall back to serial if cycle detected
+        if visited != n:
+            return self._execute_subtasks_serial(
+                result, subtasks, assignments, mode, max_retries, t0, node_ids,
+            )
+
+        subtask_results: dict[str, dict] = {}
+        _lock = threading.Lock()
+
+        for layer in layers:
+            # Check cancellation before each layer
+            if self._cancel_token and self._cancel_token.is_set():
+                result.status = "cancelled"
+                result.final_output = "工作流已取消。"
+                result.total_latency_ms = round((time.time() - t0) * 1000, 1)
+                break
+
+            if len(layer) == 1:
+                idx = layer[0]
+                sub_id = node_ids[idx]
+                subtask_results[sub_id] = self._execute_subtask(
+                    workflow_id=result.task_id,
+                    subtask_id=sub_id,
+                    subtask=subtasks[idx],
+                    assignments=assignments,
+                    mode=mode,
+                    max_retries=max_retries,
+                )
+                result.dag_nodes[idx]["status"] = self._derive_subtask_status(
+                    subtask_results[sub_id]
+                )
+            else:
+                # Multiple independent subtasks → parallel execution
+                with ThreadPoolExecutor(max_workers=len(layer)) as executor:
+                    future_map = {}
+                    for idx in layer:
+                        sub_id = node_ids[idx]
+                        future = executor.submit(
+                            self._execute_subtask,
+                            workflow_id=result.task_id,
+                            subtask_id=sub_id,
+                            subtask=subtasks[idx],
+                            assignments=assignments,
+                            mode=mode,
+                            max_retries=max_retries,
+                        )
+                        future_map[future] = (idx, sub_id)
+
+                    for future in as_completed(future_map):
+                        idx, sub_id = future_map[future]
+                        try:
+                            subtask_results[sub_id] = future.result()
+                            result.dag_nodes[idx]["status"] = self._derive_subtask_status(
+                                subtask_results[sub_id]
+                            )
+                        except Exception as e:
+                            with _lock:
+                                subtask_results[sub_id] = {
+                                    "worker": AgentResponse(
+                                        task_id=sub_id, role="Worker", status="failed"
+                                    ),
+                                    "final_content": f"错误: {e}",
+                                }
+                                result.dag_nodes[idx]["status"] = "failed"
+
+        return subtask_results
+
+    def _execute_subtasks_serial(
+        self,
+        result: WorkflowResult,
+        subtasks: list[dict],
+        assignments: dict[str, str],
+        mode: str,
+        max_retries: int,
+        t0: float,
+        node_ids: list[str],
+    ) -> dict[str, dict]:
+        """Fallback serial execution when DAG has cycles."""
+        subtask_results: dict[str, dict] = {}
+        for idx, subtask in enumerate(subtasks):
+            if self._cancel_token and self._cancel_token.is_set():
+                result.status = "cancelled"
+                result.final_output = "工作流已取消。"
+                result.total_latency_ms = round((time.time() - t0) * 1000, 1)
+                break
+
+            sub_id = node_ids[idx] if idx < len(node_ids) else f"{result.task_id}-T{idx:02d}"
+            subtask_results[sub_id] = self._execute_subtask(
+                workflow_id=result.task_id,
+                subtask_id=sub_id,
+                subtask=subtask,
+                assignments=assignments,
+                mode=mode,
+                max_retries=max_retries,
+            )
+            result.dag_nodes[idx]["status"] = self._derive_subtask_status(
+                subtask_results[sub_id]
+            )
+        return subtask_results
 
     def _assign_roles(self, primary_model: str, complexity: ComplexityReport) -> dict[str, str]:
         available_models = self.adapter.available_models or [primary_model]
@@ -247,6 +534,25 @@ class WorkflowEngine:
         complexity: ComplexityReport,
         started_at: float,
     ) -> WorkflowResult:
+        # Phase 3: Check budget before direct execution
+        if not self.budget_controller.can_call_model(result.task_id):
+            result.status = "failed"
+            result.final_output = "预算超限，无法执行。"
+            result.total_latency_ms = round((time.time() - started_at) * 1000, 1)
+            self.event_tracer.record(
+                ObsEventType.BUDGET_EXCEEDED,
+                task_id=result.task_id,
+                message="Budget exceeded before direct execution",
+            )
+            return result
+
+        self.event_tracer.record(
+            ObsEventType.TASK_STARTED,
+            task_id=result.task_id,
+            data={"mode": "direct"},
+            message="Direct mode execution started",
+        )
+
         contract = TaskContract(
             task_id=f"{result.task_id}-DIRECT",
             task_name="直接执行",
@@ -255,14 +561,14 @@ class WorkflowEngine:
             objective=user_task,
             assigned_model=model_name,
             required_capabilities=["reasoning"],
-            allowed_tools=list(self.runtime_config.get("allowed_tools", [])),
+            allowed_tools=self.runtime_config.get("allowed_tools"),
             expected_output_schema="direct_result",
             success_criteria=["直接给出完整答案"],
             timeout_seconds=int(self.runtime_config.get("timeout_seconds", 120) or 120),
             review_required=False,
         )
         response = self.runner.run(contract, model_name, stream_session=self.stream_session)
-        tool_records = self._execute_tool_calls(response, "Worker", contract.task_id, allowed_tools=contract.allowed_tools or None)
+        tool_records = self._execute_tool_calls(response, "Worker", contract.task_id, allowed_tools=contract.allowed_tools if contract.allowed_tools is not None else None)
         self._record("Worker", contract, response)
         result.subtask_results = {contract.task_id: {"worker": response, "final_content": response.content, "tool_records": tool_records, "contract": contract.to_dict()}}
         result.final_output = response.content
@@ -275,6 +581,16 @@ class WorkflowEngine:
             decision="direct_mode_complete",
             rationale=f"Direct mode answer by {model_name}",
             context={"complexity": complexity.__dict__, "runtime": self.runtime_config},
+        )
+
+        # Phase 3: Record completion
+        status_tag = ObsEventType.TASK_COMPLETED if result.status == "completed" else ObsEventType.TASK_FAILED
+        self.event_tracer.record(
+            status_tag,
+            task_id=result.task_id,
+            duration_ms=result.total_latency_ms,
+            data={"status": result.status, "mode": "direct"},
+            message=f"Direct mode {result.status}",
         )
 
         # Close streaming session
@@ -297,7 +613,7 @@ class WorkflowEngine:
             objective=user_task,
             assigned_model=model_name,
             required_capabilities=["planning", "reasoning"],
-            allowed_tools=list(self.runtime_config.get("allowed_tools", [])),
+            allowed_tools=self.runtime_config.get("allowed_tools"),
             expected_output_schema="subtasks",
             success_criteria=[f"生成 {count_hint} 个结构化的子任务"],
             timeout_seconds=int(self.runtime_config.get("timeout_seconds", 120) or 120),
@@ -332,13 +648,25 @@ class WorkflowEngine:
         mode: str,
         max_retries: int,
     ) -> dict:
+        # Phase 3: Check budget before executing subtask
+        if not self.budget_controller.can_call_model(workflow_id):
+            return self._budget_exceeded_result(subtask_id, "模型调用预算已超限")
+
         worker_model = assignments["Worker"]
         critic_model = assignments["Critic"]
         verifier_model = assignments["Verifier"]
         researcher_model = assignments.get("Researcher", worker_model)
         expert_model = assignments.get("Domain Expert", worker_model)
-        allowed_tools = list(self.runtime_config.get("allowed_tools", []))
+        allowed_tools = self.runtime_config.get("allowed_tools")
         timeout_seconds = int(self.runtime_config.get("timeout_seconds", 120) or 120)
+
+        # Phase 3: Build runtime context for this subtask
+        self.context_manager.build_runtime_context(
+            task_id=subtask_id,
+            objective=subtask.get("objective", ""),
+            dependencies=list(subtask.get("depends_on", [])),
+        )
+        self.context_manager.update_subtask_status(workflow_id, subtask_id, "running")
 
         shared_context = []
         if mode == MODE_EXPANDED:
@@ -358,12 +686,24 @@ class WorkflowEngine:
             success_criteria=subtask.get("success_criteria", []),
             timeout_seconds=timeout_seconds,
         )
-        worker_resp = self.runner.run(worker_contract, worker_model, context_messages=shared_context or None, stream_session=self.stream_session)
-        self._execute_tool_calls(worker_resp, "Worker", subtask_id, allowed_tools=allowed_tools or None)
+        # Phase 3: Worker execution with failover retry
+        current_worker_model = worker_model
+        worker_resp = self.runner.run(worker_contract, current_worker_model, context_messages=shared_context or None, stream_session=self.stream_session)
+        worker_retries = 0
+        while worker_resp.status == "failed" and worker_retries < max_retries:
+            worker_retries += 1
+            current_worker_model = self._attempt_failover(worker_model, subtask_id)
+            if not current_worker_model:
+                break
+            worker_contract.assigned_model = current_worker_model
+            worker_resp = self.runner.run(worker_contract, current_worker_model, context_messages=shared_context or None, stream_session=self.stream_session)
+
+        self._execute_tool_calls(worker_resp, "Worker", subtask_id, allowed_tools=allowed_tools)
         self._record("Worker", worker_contract, worker_resp)
         current_content = worker_resp.content
 
         if worker_resp.needs_review():
+            decision = self.supervisor.event_handling.handle("low_confidence", {"role": "Worker", "subtask": subtask.get("task_name", "")})
             self._publish_replan_signal(workflow_id, subtask_id, worker_resp, "worker_low_confidence")
 
         critic_resp = AgentResponse(task_id=subtask_id, role="Critic", status="completed")
@@ -388,7 +728,7 @@ class WorkflowEngine:
                 context_messages=[ChatMessage(role="user", content=f"## Worker 输出\n\n{current_content}")],
                 stream_session=self.stream_session,
             )
-            self._execute_tool_calls(critic_resp, "Critic", f"{subtask_id}-CRITIC", allowed_tools=allowed_tools or None)
+            self._execute_tool_calls(critic_resp, "Critic", f"{subtask_id}-CRITIC", allowed_tools=allowed_tools)
             self._record("Critic", critic_contract, critic_resp)
             verdict = (critic_resp.next_action_recommendation or "").lower()
             if "pass" in verdict:
@@ -427,7 +767,7 @@ class WorkflowEngine:
                 ],
                 stream_session=self.stream_session,
             )
-            self._execute_tool_calls(revision_resp, "Worker", f"{subtask_id}-REV{retry}", allowed_tools=allowed_tools or None)
+            self._execute_tool_calls(revision_resp, "Worker", f"{subtask_id}-REV{retry}", allowed_tools=allowed_tools)
             self._record("Worker(revision)", revision_contract, revision_resp)
             current_content = revision_resp.content
             if revision_resp.needs_review():
@@ -453,7 +793,7 @@ class WorkflowEngine:
             context_messages=[ChatMessage(role="user", content=f"## 最终输出\n\n{current_content}")],
             stream_session=self.stream_session,
         )
-        self._execute_tool_calls(verifier_resp, "Verifier", f"{subtask_id}-VERIFY", allowed_tools=allowed_tools or None)
+        self._execute_tool_calls(verifier_resp, "Verifier", f"{subtask_id}-VERIFY", allowed_tools=allowed_tools)
         self._record("Verifier", verifier_contract, verifier_resp)
         if verifier_resp.needs_review() or "fail" in (verifier_resp.next_action_recommendation or "").lower():
             self._publish_replan_signal(workflow_id, subtask_id, verifier_resp, "verifier_failed")
@@ -487,7 +827,7 @@ class WorkflowEngine:
 
     def _build_support_context(self, subtask_id: str, subtask: dict, researcher_model: str, expert_model: str) -> list[ChatMessage]:
         messages: list[ChatMessage] = []
-        allowed_tools = list(self.runtime_config.get("allowed_tools", []))
+        allowed_tools = self.runtime_config.get("allowed_tools")
         timeout_seconds = int(self.runtime_config.get("timeout_seconds", 120) or 120)
 
         researcher_contract = TaskContract(
@@ -529,8 +869,16 @@ class WorkflowEngine:
 
     def _summarize(self, workflow_id: str, subtask_results: dict, model_name: str) -> AgentResponse:
         summary_text = ""
+        critic_reports: list[dict] = []
+        verifier_reports: list[dict] = []
         for subtask_id, subtask_result in subtask_results.items():
             summary_text += f"### 子任务 {subtask_id}\n{subtask_result['final_content'][:400]}\n\n"
+            critic_resp = subtask_result.get("critic")
+            if critic_resp and hasattr(critic_resp, "to_dict"):
+                critic_reports.append(critic_resp.to_dict())
+            verifier_resp = subtask_result.get("verifier")
+            if verifier_resp and hasattr(verifier_resp, "to_dict"):
+                verifier_reports.append(verifier_resp.to_dict())
 
         contract = TaskContract(
             task_id=f"{workflow_id}-SUPER",
@@ -540,7 +888,7 @@ class WorkflowEngine:
             objective="综合所有子任务输出形成最终结果",
             assigned_model=model_name,
             required_capabilities=["synthesis", "decision"],
-            allowed_tools=list(self.runtime_config.get("allowed_tools", [])),
+            allowed_tools=self.runtime_config.get("allowed_tools"),
             expected_output_schema="final_output",
             success_criteria=["覆盖全部子任务", "裁决冲突"],
             timeout_seconds=int(self.runtime_config.get("timeout_seconds", 120) or 120),
@@ -552,7 +900,45 @@ class WorkflowEngine:
             stream_session=self.stream_session,
         )
         self._record("Supervisor", contract, response)
+
+        # Phase 3: Supervisor final review
+        review = self.supervisor.final_review.review(
+            task_id=workflow_id,
+            final_output=response.content,
+            subtask_results=subtask_results,
+            critic_reports=critic_reports,
+            verifier_reports=verifier_reports,
+        )
+        self.decision_log.log(
+            task_id=workflow_id,
+            decision="final_review",
+            rationale=f"Review: {review.status} (score={review.quality_score:.2f})",
+            context={"review": review.to_dict()},
+        )
+
         return response
+
+    # ── Phase 3: Failover Helper ────────────────────────────────────────
+
+    def _attempt_failover(self, failed_model: str, task_id: str) -> Optional[str]:
+        """Try to find a replacement model when a model call fails."""
+        # Record the failure and trigger role_manager failover
+        affected = self.role_manager.handle_failover(failed_model)
+        if not affected:
+            return None
+
+        # Find a healthy model from the pool
+        healthy = self.model_pool.healthy_models()
+        for entry in healthy:
+            if entry.model_id != failed_model:
+                self.decision_log.log(
+                    task_id=task_id,
+                    decision="model_failover_used",
+                    rationale=f"Failover from {failed_model} to {entry.model_id}",
+                    context={"original_model": failed_model, "new_model": entry.model_id},
+                )
+                return entry.model_id
+        return None
 
     # ── Phase 2 helpers ─────────────────────────────────────────────
 
@@ -674,6 +1060,22 @@ class WorkflowEngine:
         else:
             self._record_model_call_failure(model_id, error_message=response.summary[:200])
 
+        # Phase 3: track budget per model call (use workflow-level budget)
+        budget_task_id = getattr(self, '_current_workflow_id', None) or contract.task_id
+        self.budget_controller.record_model_call(
+            task_id=budget_task_id,
+            tokens=0,
+            cost=0.0,
+            is_high_cost=False,
+        )
+        self.event_tracer.record(
+            ObsEventType.TOOL_CALLED,
+            task_id=contract.task_id,
+            role=role_label,
+            data={"model": model_id, "status": response.status},
+            message=f"Model call: {role_label} on {model_id}",
+        )
+
     def _execute_tool_calls(
         self,
         response: AgentResponse,
@@ -705,7 +1107,39 @@ class WorkflowEngine:
                     "error": rd.get("error", ""),
                 },
             )
+            # Phase 3: track tool call in budget and observability
+            budget_task_id = getattr(self, '_current_workflow_id', None) or task_id
+            self.budget_controller.record_tool_call(task_id=budget_task_id)
+            success_tag = rd.get("success", False)
+            if not success_tag:
+                self.event_tracer.record(
+                    ObsEventType.TOOL_FAILED,
+                    task_id=rd.get("task_id", task_id),
+                    role=role or response.role,
+                    data={"tool_name": rd.get("tool_name", ""), "error": rd.get("error", "")},
+                    message=f"Tool failed: {rd.get('tool_name', '')}",
+                )
         return [r.to_dict() for r in records]
+
+    # ── Phase 3: Budget Helpers ──────────────────────────────────────────
+
+    def _budget_exceeded_result(self, subtask_id: str, reason: str) -> dict:
+        """Return a failed subtask result when budget is exceeded."""
+        resp = AgentResponse(task_id=subtask_id, role="Worker", status="failed")
+        resp.content = reason
+        self.event_bus.publish(
+            "BUDGET_EXCEEDED",
+            source="BudgetController",
+            task_id=subtask_id,
+            payload={"reason": reason},
+        )
+        return {
+            "worker": resp,
+            "critic": AgentResponse(task_id=subtask_id, role="Critic", status="skipped"),
+            "verifier": AgentResponse(task_id=subtask_id, role="Verifier", status="skipped"),
+            "final_content": reason,
+            "contracts": {},
+        }
 
     @staticmethod
     def _parse_subtasks(content: str) -> list[dict]:
