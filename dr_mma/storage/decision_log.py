@@ -2,11 +2,12 @@
 DecisionLog — 决策记录 (SQLite)
 
 记录工作流执行过程中所有关键决策：任务拆分、冲突裁决、重试判定等。
-使用 SQLite 存储，支持事务、索引查询和上下文管理器。
+使用 SQLite 存储，支持事务、索引查询和上下文管理器。每线程独立连接保证并发安全。
 """
 
 import json
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -79,24 +80,31 @@ class DecisionLog:
     def __init__(self, db_path: str | Path):
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_CREATE_TABLE)
-        self._conn.commit()
+        self._local = threading.local()
         self._is_open = True
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """获取当前线程的独立连接（懒初始化）"""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_CREATE_TABLE)
+            conn.commit()
+            self._local.conn = conn
+        return self._local.conn
 
     # -- Connection management --
 
     def close(self):
-        """关闭数据库连接"""
-        if self._is_open and self._conn:
+        """关闭当前线程的数据库连接"""
+        if self._is_open and hasattr(self._local, "conn") and self._local.conn:
             try:
-                self._conn.close()
+                self._local.conn.close()
             except Exception:
                 pass
-            self._is_open = False
+            self._local.conn = None
 
     def __del__(self):
         """析构时自动关闭连接"""
@@ -117,13 +125,14 @@ class DecisionLog:
         record = DecisionRecord(task_id, decision, rationale, context)
         record.record_id = f"D-{uuid.uuid4().hex}"
         context_json = json.dumps(record.context, ensure_ascii=False)
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "INSERT INTO decision_log (record_id, task_id, decision, rationale, context, timestamp) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (record.record_id, record.task_id, record.decision,
              record.rationale, context_json, record.timestamp),
         )
-        self._conn.commit()
+        conn.commit()
         return record
 
     def query(self, task_id: str = "", decision: str = "",
@@ -139,6 +148,7 @@ class DecisionLog:
         Returns:
             按时间升序排列的决策记录列表
         """
+        conn = self._get_conn()
         conditions: list[str] = []
         params: list = []
 
@@ -155,7 +165,7 @@ class DecisionLog:
         if limit > 0:
             query += f" LIMIT {limit} OFFSET {offset}"
 
-        rows = self._conn.execute(query, params).fetchall()
+        rows = conn.execute(query, params).fetchall()
         results = []
         for row in rows:
             record_dict = {
@@ -171,7 +181,8 @@ class DecisionLog:
 
     def get(self, record_id: str) -> Optional[DecisionRecord]:
         """按记录 ID 获取单条"""
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT record_id, task_id, decision, rationale, context, timestamp "
             "FROM decision_log WHERE record_id = ?", (record_id,)
         ).fetchone()
@@ -185,6 +196,7 @@ class DecisionLog:
 
     def count(self, task_id: str = "", decision: str = "") -> int:
         """统计记录条数"""
+        conn = self._get_conn()
         conditions: list[str] = []
         params: list = []
         if task_id:
@@ -194,19 +206,21 @@ class DecisionLog:
             conditions.append("decision = ?")
             params.append(decision)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        row = self._conn.execute(
+        row = conn.execute(
             f"SELECT COUNT(*) FROM decision_log{where}", params
         ).fetchone()
         return row[0] if row else 0
 
     def delete(self, record_id: str) -> bool:
         """删除一条记录"""
-        cursor = self._conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             "DELETE FROM decision_log WHERE record_id = ?", (record_id,))
-        self._conn.commit()
+        conn.commit()
         return cursor.rowcount > 0
 
     def clear(self):
         """清空所有记录（谨慎使用）"""
-        self._conn.execute("DELETE FROM decision_log")
-        self._conn.commit()
+        conn = self._get_conn()
+        conn.execute("DELETE FROM decision_log")
+        conn.commit()

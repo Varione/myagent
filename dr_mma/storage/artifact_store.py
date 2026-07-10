@@ -2,11 +2,12 @@
 ArtifactStore — 产物线性版本管理 (SQLite)
 
 每个 artifact 有唯一 ID 和递增版本号。使用 SQLite 存储，保证版本链
-完整无间隙（version 从 1 递增，每次 +1）。
+完整无间隙（version 从 1 递增，每次 +1）。每线程独立连接保证并发安全。
 """
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone
@@ -75,29 +76,43 @@ class ArtifactStore:
     def __init__(self, db_path: str | Path = None):
         self._db_path = Path(db_path) if db_path else Path(":memory:")
         self._is_open = False
+        self._local = threading.local()
         if str(self._db_path) != ":memory:":
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             # If given a directory, create a default database file inside it
             if self._db_path.is_dir():
                 self._db_path = self._db_path / "artifact_store.db"
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_CREATE_TABLE)
-        self._conn.commit()
+
+        conn = self._create_conn()
+        self._local.conn = conn
         self._is_open = True
+
+    def _create_conn(self) -> sqlite3.Connection:
+        """创建一个新的数据库连接"""
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_CREATE_TABLE)
+        conn.commit()
+        return conn
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """获取当前线程的独立连接（懒初始化）"""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = self._create_conn()
+        return self._local.conn
 
     # -- Connection management --
 
     def close(self):
-        """关闭数据库连接"""
-        if self._is_open and self._conn:
+        """关闭当前线程的数据库连接"""
+        if self._is_open and hasattr(self._local, "conn") and self._local.conn:
             try:
-                self._conn.close()
+                self._local.conn.close()
             except Exception:
                 pass
-            self._is_open = False
+            self._local.conn = None
 
     def __del__(self):
         self.close()
@@ -114,7 +129,8 @@ class ArtifactStore:
     def save(self, artifact_id: str, content: str,
              metadata: dict = None) -> ArtifactVersion:
         """保存新版本（自动递增版本号，保证版本链无缝）"""
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT MAX(version) FROM artifact WHERE artifact_id = ?",
             (artifact_id,),
         ).fetchone()
@@ -125,17 +141,18 @@ class ArtifactStore:
         av = ArtifactVersion(artifact_id, next_ver, content, metadata or {})
         av.created_at = now
 
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO artifact (artifact_id, version, content, metadata, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (artifact_id, next_ver, content, metadata_json, now),
         )
-        self._conn.commit()
+        conn.commit()
         return av
 
     def get_latest(self, artifact_id: str) -> Optional[ArtifactVersion]:
         """获取最新版本"""
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT artifact_id, version, content, metadata, created_at "
             "FROM artifact WHERE artifact_id = ? "
             "ORDER BY version DESC LIMIT 1",
@@ -145,7 +162,8 @@ class ArtifactStore:
 
     def get_version(self, artifact_id: str, version: int) -> Optional[ArtifactVersion]:
         """获取指定版本"""
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT artifact_id, version, content, metadata, created_at "
             "FROM artifact WHERE artifact_id = ? AND version = ?",
             (artifact_id, version),
@@ -154,7 +172,8 @@ class ArtifactStore:
 
     def list_versions(self, artifact_id: str) -> list[ArtifactVersion]:
         """列出所有版本（从旧到新）"""
-        rows = self._conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT artifact_id, version, content, metadata, created_at "
             "FROM artifact WHERE artifact_id = ? "
             "ORDER BY version ASC",
@@ -164,30 +183,34 @@ class ArtifactStore:
 
     def list_artifacts(self) -> list[str]:
         """列出所有 artifact ID"""
-        rows = self._conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT DISTINCT artifact_id FROM artifact ORDER BY artifact_id"
         ).fetchall()
         return [r[0] for r in rows]
 
     def count(self) -> int:
         """统计所有版本总数"""
-        row = self._conn.execute("SELECT COUNT(*) FROM artifact").fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT COUNT(*) FROM artifact").fetchone()
         return row[0] if row else 0
 
     def delete_artifact(self, artifact_id: str) -> bool:
         """删除整个 artifact 及其所有版本"""
-        cursor = self._conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             "DELETE FROM artifact WHERE artifact_id = ?", (artifact_id,))
-        self._conn.commit()
+        conn.commit()
         return cursor.rowcount > 0
 
     def delete_version(self, artifact_id: str, version: int) -> bool:
         """删除指定版本"""
-        cursor = self._conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             "DELETE FROM artifact WHERE artifact_id = ? AND version = ?",
             (artifact_id, version),
         )
-        self._conn.commit()
+        conn.commit()
         return cursor.rowcount > 0
 
     # -- Version Chain Integrity --

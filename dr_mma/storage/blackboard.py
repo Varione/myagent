@@ -2,11 +2,12 @@
 Blackboard — 黑板持久化存储 (SQLite)
 
 使用 SQLite 存储 agent 执行过程中的中间结果。支持事务、索引查询、
-上下文管理器和按条件过滤。
+上下文管理器和按条件过滤。每线程独立连接保证并发安全。
 """
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -40,24 +41,31 @@ class Blackboard:
     def __init__(self, db_path: str | Path):
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_CREATE_TABLE)
-        self._conn.commit()
+        self._local = threading.local()
         self._is_open = True
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """获取当前线程的独立连接（懒初始化）"""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_CREATE_TABLE)
+            conn.commit()
+            self._local.conn = conn
+        return self._local.conn
 
     # -- Connection management --
 
     def close(self):
-        """关闭数据库连接"""
-        if self._is_open and self._conn:
+        """关闭当前线程的数据库连接"""
+        if self._is_open and hasattr(self._local, "conn") and self._local.conn:
             try:
-                self._conn.close()
+                self._local.conn.close()
             except Exception:
                 pass
-            self._is_open = False
+            self._local.conn = None
 
     def __del__(self):
         """析构时自动关闭连接"""
@@ -74,21 +82,23 @@ class Blackboard:
 
     def write(self, entry: BlackboardEntry) -> str:
         """写入一条记录，返回 entry_id"""
+        conn = self._get_conn()
         payload_json = json.dumps(entry.payload, ensure_ascii=False)
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO blackboard (entry_id, task_id, source_role, content_type, summary, payload, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (entry.entry_id, entry.task_id, entry.source_role,
              entry.content_type, entry.summary, payload_json, entry.created_at),
         )
-        self._conn.commit()
+        conn.commit()
         return entry.entry_id
 
     # ── 读操作 ──
 
     def read(self, entry_id: str) -> Optional[BlackboardEntry]:
         """按 entry_id 读取单条"""
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT entry_id, task_id, source_role, content_type, summary, payload, created_at "
             "FROM blackboard WHERE entry_id = ?", (entry_id,)
         ).fetchone()
@@ -105,6 +115,7 @@ class Blackboard:
         offset: int = 0,
     ) -> list[BlackboardEntry]:
         """按条件查询黑板条目"""
+        conn = self._get_conn()
         conditions: list[str] = []
         params: list = []
 
@@ -124,37 +135,41 @@ class Blackboard:
         if limit > 0:
             query += f" LIMIT {limit} OFFSET {offset}"
 
-        rows = self._conn.execute(query, params).fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
     def get_latest(self, task_id: str = "") -> Optional[BlackboardEntry]:
         """获取最新一条记录"""
+        conn = self._get_conn()
         query = "SELECT entry_id, task_id, source_role, content_type, summary, payload, created_at FROM blackboard"
         params: list = []
         if task_id:
             query += " WHERE task_id = ?"
             params.append(task_id)
         query += " ORDER BY id DESC LIMIT 1"
-        row = self._conn.execute(query, params).fetchone()
+        row = conn.execute(query, params).fetchone()
         return self._row_to_entry(row) if row else None
 
     # ── 统计与维护 ──
 
     def count(self) -> int:
         """统计条目数"""
-        row = self._conn.execute("SELECT COUNT(*) FROM blackboard").fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT COUNT(*) FROM blackboard").fetchone()
         return row[0] if row else 0
 
     def clear(self):
         """清空所有条目（SQLite 后端保留数据库文件，只清除数据）"""
-        self._conn.execute("DELETE FROM blackboard")
-        self._conn.commit()
+        conn = self._get_conn()
+        conn.execute("DELETE FROM blackboard")
+        conn.commit()
 
     def delete(self, entry_id: str) -> bool:
         """删除指定条目"""
-        cursor = self._conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             "DELETE FROM blackboard WHERE entry_id = ?", (entry_id,))
-        self._conn.commit()
+        conn.commit()
         return cursor.rowcount > 0
 
     # ── Helper ──
