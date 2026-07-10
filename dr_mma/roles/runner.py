@@ -4,11 +4,14 @@ RoleRunner — 角色执行器
 根据角色类型加载对应的 system prompt，结合 Task Contract 调用 ModelAdapter 执行。
 """
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..engine.streaming import StreamSession
 
 from ..models.adapter import ModelAdapter, ChatMessage, ModelResponse
 from ..schemas.task_contract import TaskContract
-from ..schemas.agent_response import AgentResponse
+from ..schemas.agent_response import AgentResponse, ToolCall
 from ..schemas.blackboard_entry import BlackboardEntry
 from .prompts import RolePromptLibrary
 
@@ -25,6 +28,7 @@ class RoleRunner:
         contract: TaskContract,
         model_name: str,
         context_messages: Optional[list[ChatMessage]] = None,
+        stream_session: Optional["StreamSession"] = None,
     ) -> AgentResponse:
         """
         执行角色任务。
@@ -33,6 +37,7 @@ class RoleRunner:
             contract: 子任务合同
             model_name: 使用的模型名称
             context_messages: 额外的上下文消息（如黑板条目）
+            stream_session: 可选的流式会话，用于实时推送文本增量
         """
         system_prompt = self.prompts.get_prompt(contract.role)
         if not system_prompt:
@@ -67,6 +72,9 @@ class RoleRunner:
         )
         messages.append(ChatMessage(role="user", content=user_message))
 
+        if stream_session is not None:
+            return self._run_with_stream(contract, model_name, messages, stream_session)
+
         # 调用模型
         resp = self.adapter.chat(model_name, messages)
 
@@ -81,8 +89,52 @@ class RoleRunner:
         # 解析输出
         return self._parse_response(contract, resp)
 
+    def _run_with_stream(
+        self,
+        contract: TaskContract,
+        model_name: str,
+        messages: list[ChatMessage],
+        stream_session: "StreamSession",
+    ) -> AgentResponse:
+        """通过流式会话执行，实时推送文本增量并收集完整响应。"""
+        model = self.adapter.get(model_name)
+        if model is None:
+            return AgentResponse(
+                task_id=contract.task_id,
+                role=contract.role,
+                status="failed",
+                summary=f"错误: 模型 '{model_name}' 未注册",
+            )
+
+        full_content = []
+        try:
+            for chunk in model.chat_stream(messages):
+                full_content.append(chunk)
+                stream_session.send_chunk(chunk)
+        except Exception as e:
+            stream_session.close(error=str(e))
+            return AgentResponse(
+                task_id=contract.task_id,
+                role=contract.role,
+                status="failed",
+                summary=f"流式调用失败: {e}",
+            )
+
+        content = "".join(full_content)
+
+        resp = ModelResponse(content=content, model_name=model_name)
+        if resp.status == "error":
+            return AgentResponse(
+                task_id=contract.task_id,
+                role=contract.role,
+                status="failed",
+                summary=f"模型调用失败: {content}",
+            )
+
+        return self._parse_response(contract, resp)
+
     def _parse_response(self, contract: TaskContract, resp: ModelResponse) -> AgentResponse:
-        """从模型原始输出中解析 AgentResponse"""
+        """从模型原始输出中解析 AgentResponse，包含工具调用请求"""
         content = resp.content.strip()
 
         # 尝试提取 JSON（模型可能输出 markdown 代码块）
@@ -92,7 +144,7 @@ class RoleRunner:
             import json
             try:
                 data = json.loads(json_str)
-                return AgentResponse.from_dict({
+                result_dict = {
                     "task_id": contract.task_id,
                     "role": contract.role,
                     "status": data.get("status", "completed"),
@@ -101,7 +153,9 @@ class RoleRunner:
                     "claims": data.get("claims", []),
                     "risks": data.get("risks", []),
                     "next_action_recommendation": data.get("next_action_recommendation", ""),
-                })
+                    "tool_calls": data.get("tool_calls", []),
+                }
+                return AgentResponse.from_dict(result_dict)
             except json.JSONDecodeError:
                 pass
 

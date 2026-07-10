@@ -73,6 +73,7 @@ class LogPanel(ctk.CTkFrame):
             self.controller.t("logs_events"),
             self.controller.t("logs_blackboard"),
             self.controller.t("logs_decisions"),
+            self.controller.t("logs_tools"),
         ]
         self.log_type.configure(values=values)
         self.log_type.set(values[0])
@@ -101,6 +102,8 @@ class LogPanel(ctk.CTkFrame):
             self._refresh_blackboard()
         elif value == self.controller.t("logs_decisions"):
             self._refresh_decision_log()
+        elif value == self.controller.t("logs_tools"):
+            self._refresh_tools()
         self.log_text.configure(state="disabled")
 
     def _render_runtime_logs(self):
@@ -167,6 +170,34 @@ class LogPanel(ctk.CTkFrame):
                 self.log_text.insert("end", f"[{record.decision}] Task {record.task_id}: {record.rationale[:120]}\n")
         except Exception as exc:
             self.log_text.insert("1.0", f"{self.controller.t('logs_decisions_failed', error=exc)}\n")
+
+    def _refresh_tools(self):
+        records = self.controller.get_tool_execution_records()
+        if not records:
+            self.log_text.insert("1.0", f"{self.controller.t('tools_none')}\n")
+            return
+        for record in records[-50:]:
+            tool_name = record.get("tool_name", "unknown")
+            role = record.get("role", "")
+            latency_ms = record.get("latency_ms", 0)
+            permission_allowed = record.get("permission_allowed", True)
+            success = record.get("success", False)
+            error = record.get("error", "")
+            output = record.get("output", "")
+            permission_reason = record.get("permission_reason", "")
+
+            if not permission_allowed:
+                status_text = self.controller.t("tools_denied")
+                detail = f"[{tool_name}] role={role} status={status_text} latency={latency_ms:.0f}ms | reason: {permission_reason}"
+            elif success:
+                preview = (output or "")[:200] if output else ""
+                status_text = self.controller.t("tools_success")
+                detail = f"[{tool_name}] role={role} status={status_text} latency={latency_ms:.0f}ms | {preview}"
+            else:
+                status_text = self.controller.t("tools_failed")
+                detail = f"[{tool_name}] role={role} status={status_text} latency={latency_ms:.0f}ms | error: {error}"
+
+            self.log_text.insert("end", f"{detail}\n")
 
     def _clear_logs(self):
         self.log_text.configure(state="normal")

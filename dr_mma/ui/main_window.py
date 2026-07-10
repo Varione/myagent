@@ -365,5 +365,6 @@ class MainWindow(ctk.CTk):
             pass
 
     def _on_close(self):
+        self.controller.save_config()
         self.controller.cancel()
         self.destroy()

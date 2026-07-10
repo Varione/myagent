@@ -25,6 +25,13 @@ class Risk:
 
 
 @dataclass
+class ToolCall:
+    """工具调用请求"""
+    tool_name: str = ""
+    args: dict = field(default_factory=dict)
+
+
+@dataclass
 class ArtifactRef:
     """产物引用"""
     artifact_id: str = ""
@@ -46,6 +53,8 @@ class AgentResponse:
         artifacts: 产物引用列表
         risks: 风险提示列表
         next_action_recommendation: 建议下一步操作
+        tool_calls: 工具调用请求列表
+        tool_results: 工具执行结果列表（由工作流填充）
     """
     task_id: str = ""
     role: str = ""
@@ -56,6 +65,8 @@ class AgentResponse:
     artifacts: list[ArtifactRef] = field(default_factory=list)
     risks: list[Risk] = field(default_factory=list)
     next_action_recommendation: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -65,6 +76,7 @@ class AgentResponse:
         claims = [Claim(**c) for c in data.get("claims", [])]
         artifacts = [ArtifactRef(**a) for a in data.get("artifacts", [])]
         risks = [Risk(**r) for r in data.get("risks", [])]
+        tool_calls = [ToolCall(**t) for t in data.get("tool_calls", [])]
         return cls(
             task_id=data.get("task_id", ""),
             role=data.get("role", ""),
@@ -75,6 +87,8 @@ class AgentResponse:
             artifacts=artifacts,
             risks=risks,
             next_action_recommendation=data.get("next_action_recommendation", ""),
+            tool_calls=tool_calls,
+            tool_results=data.get("tool_results", []),
         )
 
     def to_json(self) -> str:
@@ -85,3 +99,7 @@ class AgentResponse:
 
     def needs_review(self) -> bool:
         return self.status in ("need_review", "low_confidence")
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return len(self.tool_calls) > 0

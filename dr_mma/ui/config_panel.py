@@ -476,6 +476,11 @@ class ConfigPanel(ctk.CTkFrame):
             )
             card.pack(pady=(0, 8), fill="x")
             self._model_cards.append(card)
+        self._path_entry.delete(0, "end")
+        bb_path = self.controller.config.get("blackboard_path", "")
+        if bb_path:
+            import os.path
+            self._path_entry.insert(0, os.path.dirname(bb_path) or bb_path)
         self._workspace_entry.delete(0, "end")
         self._workspace_entry.insert(0, self.controller.config.get("workspace_root", ""))
         self._tools_entry.delete(0, "end")

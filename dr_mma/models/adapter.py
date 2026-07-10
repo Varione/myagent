@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
 import time
-from typing import Optional
+from typing import Generator, Optional
 
 import requests
 
@@ -38,6 +38,29 @@ def _normalize_model_key(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
+def _split_into_chunks(text: str, chunk_size: int = 80) -> Generator[str, None, None]:
+    """Split text into chunks for simulated streaming."""
+    for i in range(0, len(text), chunk_size):
+        yield text[i:i + chunk_size]
+
+
+def _parse_sse_line(line: str) -> Optional[str]:
+    """Parse a single SSE line, extract delta text from 'data: ...'."""
+    line = line.strip()
+    if not line or line == "data: [DONE]":
+        return None
+    if line.startswith("data: "):
+        data_str = line[6:]
+        try:
+            data = json.loads(data_str)
+            delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+            if delta:
+                return delta
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 @dataclass
 class ChatMessage:
     role: str = "user"
@@ -65,6 +88,15 @@ class BaseModel(ABC):
     @abstractmethod
     def chat(self, messages: list[ChatMessage], **kwargs) -> ModelResponse:
         ...
+
+    def chat_stream(self, messages: list[ChatMessage], **kwargs) -> Generator[str, None, None]:
+        """Yield text chunks. Default fallback splits synchronous response."""
+        resp = self.chat(messages, **kwargs)
+        if resp.status == "error":
+            yield resp.error_message or resp.content
+            return
+        for chunk in _split_into_chunks(resp.content):
+            yield chunk
 
     @property
     @abstractmethod
@@ -133,6 +165,36 @@ class LocalModel(BaseModel):
 
     def chat(self, messages: list[ChatMessage], **kwargs) -> ModelResponse:
         return self._request_chat(messages, kwargs, allow_fallback=True)
+
+    def chat_stream(self, messages: list[ChatMessage], **kwargs) -> Generator[str, None, None]:
+        payload = {
+            "model": self._model_name,
+            "messages": [message.to_dict() for message in messages],
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 4096),
+            "stream": True,
+        }
+        collected: list[str] = []
+        try:
+            resp = requests.post(
+                f"{self._endpoint}/chat/completions",
+                json=payload,
+                timeout=self._timeout,
+                stream=True,
+            )
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace")
+                chunk = _parse_sse_line(line)
+                if chunk:
+                    collected.append(chunk)
+                    yield chunk
+        except Exception as exc:
+            error_msg = _extract_error_message(exc)
+            if not collected:
+                yield f"[stream error] {error_msg}"
 
     def _request_chat(self, messages: list[ChatMessage], kwargs: dict, allow_fallback: bool) -> ModelResponse:
         t0 = time.time()
@@ -268,6 +330,36 @@ class RemoteModel(BaseModel):
                     "endpoint": self._endpoint,
                 },
             )
+
+    def chat_stream(self, messages: list[ChatMessage], **kwargs) -> Generator[str, None, None]:
+        payload = {
+            "model": self._model_name,
+            "messages": [message.to_dict() for message in messages],
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 8192),
+            "stream": True,
+        }
+        try:
+            resp = requests.post(
+                f"{self._endpoint}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self._timeout,
+                stream=True,
+            )
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace")
+                chunk = _parse_sse_line(line)
+                if chunk:
+                    yield chunk
+        except Exception as exc:
+            yield f"[stream error] {_extract_error_message(exc)}"
 
 
 class MockModel(BaseModel):

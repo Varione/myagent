@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..engine.streaming import StreamEventKind
 from ..engine.workflow import WorkflowEngine, WorkflowResult
 from ..models.adapter import LocalModel, MockModel, ModelAdapter, RemoteModel
 from ..storage.artifact_store import ArtifactStore
@@ -101,6 +102,10 @@ class WorkflowController:
 
         if not restored:
             self._register_default_mock()
+
+        # Ensure config file exists on first launch
+        if not CONFIG_FILE.exists():
+            self.save_config()
 
     def save_config(self):
         """Persist registered models and storage paths."""
@@ -226,6 +231,12 @@ class WorkflowController:
         except Exception:
             return []
 
+    def get_tool_execution_records(self) -> list[dict]:
+        """Get tool execution records from the current engine's ToolExecutor."""
+        if self._engine and getattr(self._engine, "tool_executor", None):
+            return self._engine.tool_executor.get_records_dict()
+        return []
+
     def append_runtime_log(self, message: str):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -305,6 +316,10 @@ class WorkflowController:
 
             if "Mock" in model_name:
                 self._setup_mock_responses(model_name, task_text)
+
+            # Subscribe to streaming session via callback
+            if engine.stream_session:
+                engine.stream_session.on_event(self._on_stream_event)
 
             result = engine.execute(task_text, model_name)
             self._last_result = result
@@ -424,6 +439,33 @@ class WorkflowController:
     def _notify_error(self, msg: str):
         if self.on_error:
             self._app_safe_call(self.on_error, msg)
+
+    def _on_stream_event(self, event):
+        """Handle streaming events and push to log."""
+        from ..engine.streaming import StreamEventKind
+
+        if event.kind == StreamEventKind.CHUNK:
+            text = event.data.get("text", "")
+            if text:
+                self._log(f"[stream] {text}")
+        elif event.kind == StreamEventKind.TOOL_CALL:
+            tool = event.data.get("tool", "unknown")
+            args = event.data.get("args", {})
+            self._log(f"[tool_call] {tool}({args})")
+        elif event.kind == StreamEventKind.TOOL_RESULT:
+            tool = event.data.get("tool", "unknown")
+            success = event.data.get("success", False)
+            result = event.data.get("result", {})
+            status = "success" if success else "failed"
+            self._log(f"[tool_result] {tool} -> {status}: {str(result)[:100]}")
+        elif event.kind == StreamEventKind.THINKING:
+            content = event.data.get("content", "")
+            self._log(f"[thinking] {content[:200]}")
+        elif event.kind == StreamEventKind.DONE:
+            self._log("[stream] 流式输出完成")
+        elif event.kind == StreamEventKind.ERROR:
+            error = event.data.get("error", "unknown")
+            self._log(f"[stream error] {error}")
 
     def _log(self, msg: str):
         self.append_runtime_log(msg)

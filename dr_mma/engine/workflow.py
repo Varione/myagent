@@ -32,8 +32,12 @@ from .events import (
     EVENT_WORKFLOW_MODE,
     EventBus,
 )
+from .streaming import StreamSession
 from .model_pool import ModelPool
+from .permissions import PermissionManager
 from .role_manager import RoleBinding, RoleMergerSplitter
+from .tool_executor import ToolExecutor
+from .tools import ToolRegistry, create_default_tool_registry
 
 
 @dataclass
@@ -86,6 +90,17 @@ class WorkflowEngine:
             registry=self.capability_registry,
         )
 
+        # Tool execution: bridge ToolRegistry + PermissionManager
+        self.tool_registry = create_default_tool_registry()
+        self.permission_manager = PermissionManager()
+        self.tool_executor = ToolExecutor(
+            registry=self.tool_registry,
+            permission_manager=self.permission_manager,
+        )
+
+        # Streaming session (set during execute())
+        self.stream_session: Optional[StreamSession] = None
+
     def execute(self, user_task: str, model_name: str = "", max_retries: int = 1) -> WorkflowResult:
         import time
 
@@ -100,6 +115,10 @@ class WorkflowEngine:
 
         result = WorkflowResult(task_id=f"WF-{hash(user_task) % 100000:05d}")
         result.runtime_config = dict(self.runtime_config)
+
+        # Create streaming session for this workflow execution
+        self.stream_session = StreamSession(stream_id=result.task_id)
+
         complexity = self.complexity_evaluator.evaluate(user_task)
         assignments = self._assign_roles(primary_model, complexity)
         result.mode = complexity.mode
@@ -175,6 +194,11 @@ class WorkflowEngine:
             rationale=f"完成 {len(subtasks)} 个子任务，状态 {result.status}",
             context={"events": result.event_count, "mode": result.mode, "runtime": self.runtime_config},
         )
+
+        # Close streaming session
+        if self.stream_session and not self.stream_session.producer.is_closed:
+            self.stream_session.close()
+
         return result
 
     def _assign_roles(self, primary_model: str, complexity: ComplexityReport) -> dict[str, str]:
@@ -237,9 +261,10 @@ class WorkflowEngine:
             timeout_seconds=int(self.runtime_config.get("timeout_seconds", 120) or 120),
             review_required=False,
         )
-        response = self.runner.run(contract, model_name)
+        response = self.runner.run(contract, model_name, stream_session=self.stream_session)
+        tool_records = self._execute_tool_calls(response, "Worker", contract.task_id, allowed_tools=contract.allowed_tools or None)
         self._record("Worker", contract, response)
-        result.subtask_results = {contract.task_id: {"worker": response, "final_content": response.content, "contract": contract.to_dict()}}
+        result.subtask_results = {contract.task_id: {"worker": response, "final_content": response.content, "tool_records": tool_records, "contract": contract.to_dict()}}
         result.final_output = response.content
         result.blackboard_count = self.blackboard.count()
         result.total_latency_ms = round((time.time() - started_at) * 1000, 1)
@@ -251,6 +276,11 @@ class WorkflowEngine:
             rationale=f"Direct mode answer by {model_name}",
             context={"complexity": complexity.__dict__, "runtime": self.runtime_config},
         )
+
+        # Close streaming session
+        if self.stream_session and not self.stream_session.producer.is_closed:
+            self.stream_session.close()
+
         return result
 
     def _plan_subtasks(self, workflow_id: str, user_task: str, model_name: str, complexity: ComplexityReport) -> list[dict]:
@@ -283,7 +313,7 @@ class WorkflowEngine:
                 ),
             )
         ]
-        response = self.runner.run(contract, model_name, context_messages=context)
+        response = self.runner.run(contract, model_name, context_messages=context, stream_session=self.stream_session)
         self._record("Planner", contract, response)
         self.decision_log.log(
             task_id=workflow_id,
@@ -328,7 +358,8 @@ class WorkflowEngine:
             success_criteria=subtask.get("success_criteria", []),
             timeout_seconds=timeout_seconds,
         )
-        worker_resp = self.runner.run(worker_contract, worker_model, context_messages=shared_context or None)
+        worker_resp = self.runner.run(worker_contract, worker_model, context_messages=shared_context or None, stream_session=self.stream_session)
+        self._execute_tool_calls(worker_resp, "Worker", subtask_id, allowed_tools=allowed_tools or None)
         self._record("Worker", worker_contract, worker_resp)
         current_content = worker_resp.content
 
@@ -355,7 +386,9 @@ class WorkflowEngine:
                 critic_contract,
                 critic_model,
                 context_messages=[ChatMessage(role="user", content=f"## Worker 输出\n\n{current_content}")],
+                stream_session=self.stream_session,
             )
+            self._execute_tool_calls(critic_resp, "Critic", f"{subtask_id}-CRITIC", allowed_tools=allowed_tools or None)
             self._record("Critic", critic_contract, critic_resp)
             verdict = (critic_resp.next_action_recommendation or "").lower()
             if "pass" in verdict:
@@ -392,7 +425,9 @@ class WorkflowEngine:
                     ChatMessage(role="user", content=f"## 批评意见\n\n{critic_resp.content}"),
                     ChatMessage(role="user", content=f"## 原始输出\n\n{current_content}"),
                 ],
+                stream_session=self.stream_session,
             )
+            self._execute_tool_calls(revision_resp, "Worker", f"{subtask_id}-REV{retry}", allowed_tools=allowed_tools or None)
             self._record("Worker(revision)", revision_contract, revision_resp)
             current_content = revision_resp.content
             if revision_resp.needs_review():
@@ -416,7 +451,9 @@ class WorkflowEngine:
             verifier_contract,
             verifier_model,
             context_messages=[ChatMessage(role="user", content=f"## 最终输出\n\n{current_content}")],
+            stream_session=self.stream_session,
         )
+        self._execute_tool_calls(verifier_resp, "Verifier", f"{subtask_id}-VERIFY", allowed_tools=allowed_tools or None)
         self._record("Verifier", verifier_contract, verifier_resp)
         if verifier_resp.needs_review() or "fail" in (verifier_resp.next_action_recommendation or "").lower():
             self._publish_replan_signal(workflow_id, subtask_id, verifier_resp, "verifier_failed")
@@ -467,7 +504,7 @@ class WorkflowEngine:
             timeout_seconds=timeout_seconds,
             review_required=False,
         )
-        research_resp = self.runner.run(researcher_contract, researcher_model)
+        research_resp = self.runner.run(researcher_contract, researcher_model, stream_session=self.stream_session)
         self._record("Researcher", researcher_contract, research_resp)
         messages.append(ChatMessage(role="user", content=f"## Research Notes\n\n{research_resp.content}"))
 
@@ -485,7 +522,7 @@ class WorkflowEngine:
             timeout_seconds=timeout_seconds,
             review_required=False,
         )
-        expert_resp = self.runner.run(expert_contract, expert_model)
+        expert_resp = self.runner.run(expert_contract, expert_model, stream_session=self.stream_session)
         self._record("Domain Expert", expert_contract, expert_resp)
         messages.append(ChatMessage(role="user", content=f"## Domain Expert Notes\n\n{expert_resp.content}"))
         return messages
@@ -512,6 +549,7 @@ class WorkflowEngine:
             contract,
             model_name,
             context_messages=[ChatMessage(role="user", content=f"## 所有子任务汇总\n\n{summary_text}")],
+            stream_session=self.stream_session,
         )
         self._record("Supervisor", contract, response)
         return response
@@ -635,6 +673,39 @@ class WorkflowEngine:
             self._record_model_call_success(model_id)
         else:
             self._record_model_call_failure(model_id, error_message=response.summary[:200])
+
+    def _execute_tool_calls(
+        self,
+        response: AgentResponse,
+        role: str = "",
+        task_id: str = "",
+        allowed_tools: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Execute tool calls from an AgentResponse and return execution records."""
+        if not response.has_tool_calls:
+            return []
+        records = self.tool_executor.execute_calls(
+            response,
+            role=role or response.role,
+            task_id=task_id,
+            allowed_tools=allowed_tools,
+        )
+        # Publish tool execution events
+        for record in records:
+            rd = record.to_dict()
+            self.event_bus.publish(
+                "TOOL_EXECUTED",
+                source=rd.get("role", ""),
+                task_id=rd.get("task_id", ""),
+                payload={
+                    "tool_name": rd.get("tool_name", ""),
+                    "success": rd.get("success", False),
+                    "permission_allowed": rd.get("permission_allowed", True),
+                    "permission_reason": rd.get("permission_reason", ""),
+                    "error": rd.get("error", ""),
+                },
+            )
+        return [r.to_dict() for r in records]
 
     @staticmethod
     def _parse_subtasks(content: str) -> list[dict]:

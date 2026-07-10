@@ -64,12 +64,17 @@ from .tool_protocol import (
     SchemaField,
     ToolProtocol,
 )
+from .tool_executor import (
+    ToolExecutionRecord,
+    ToolExecutor,
+)
 from .tools import (
     ToolCategory,
     ToolSafetyLevel,
     ToolDefinition,
     ToolResult,
     ToolRegistry,
+    create_default_tool_registry,
 )
 from .vector_memory import MemoryEntry, TextVectorizer
 from .window_manager import (
@@ -147,10 +152,13 @@ __all__ = [
     "TextVectorizer",
     "ToolCategory",
     "ToolDefinition",
+    "ToolExecutor",
+    "ToolExecutionRecord",
     "ToolProtocol",
     "ToolRegistry",
     "ToolResult",
     "ToolSafetyLevel",
+    "create_default_tool_registry",
     "TriggerMode",
     "ValidationError",
     "ValueSource",
