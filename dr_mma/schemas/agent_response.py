@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 import json
 
 
-VALID_STATUSES = {"completed", "failed", "need_review", "low_confidence", "skipped"}
+VALID_STATUSES = {"completed", "failed", "need_review", "low_confidence", "skipped", "schema_error"}
 VALID_ROLES = {"Planner", "Worker", "Critic", "Verifier", "Supervisor", "Researcher",
                "Domain Expert", ""}
 VALID_SEVERITIES = {"low", "medium", "high"}

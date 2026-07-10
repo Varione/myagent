@@ -389,10 +389,17 @@ class WorkflowEngine:
                     if in_degree[dep_idx] == 0:
                         queue.append(dep_idx)
 
+        # ── P1-1: Build explicit task_name → task_id index (before cycle check) ──
+        task_name_to_id: dict[str, str] = {}
+        for idx, sub in enumerate(subtasks):
+            name = sub.get("task_name", "")
+            if name and name not in task_name_to_id:  # first wins on duplicates
+                task_name_to_id[name] = node_ids[idx]
+
         # Fall back to serial if cycle detected
         if visited != n:
             return self._execute_subtasks_serial(
-                result, subtasks, assignments, mode, max_retries, t0, node_ids,
+                result, subtasks, assignments, mode, max_retries, t0, node_ids, task_name_to_id,
             )
 
         subtask_results: dict[str, dict] = {}
@@ -417,6 +424,7 @@ class WorkflowEngine:
                     mode=mode,
                     max_retries=max_retries,
                     subtask_results=subtask_results,
+                    task_name_to_id=task_name_to_id,
                 )
                 result.dag_nodes[idx]["status"] = self._derive_subtask_status(
                     subtask_results[sub_id]
@@ -436,6 +444,7 @@ class WorkflowEngine:
                             mode=mode,
                             max_retries=max_retries,
                             subtask_results=subtask_results,
+                            task_name_to_id=task_name_to_id,
                         )
                         future_map[future] = (idx, sub_id)
 
@@ -467,6 +476,7 @@ class WorkflowEngine:
         max_retries: int,
         t0: float,
         node_ids: list[str],
+        task_name_to_id: Optional[dict[str, str]] = None,
     ) -> dict[str, dict]:
         """Fallback serial execution when DAG has cycles."""
         subtask_results: dict[str, dict] = {}
@@ -486,6 +496,7 @@ class WorkflowEngine:
                 mode=mode,
                 max_retries=max_retries,
                 subtask_results=subtask_results,
+                task_name_to_id=task_name_to_id,
             )
             result.dag_nodes[idx]["status"] = self._derive_subtask_status(
                 subtask_results[sub_id]
@@ -643,24 +654,54 @@ class WorkflowEngine:
         )
         return self._parse_subtasks(response.content)
 
-    def _collect_dependency_results(self, subtask: dict, subtask_results: dict) -> list[dict]:
-        """Collect upstream task results for dependency injection."""
+    def _collect_dependency_results(
+        self,
+        subtask: dict,
+        subtask_results: dict,
+        task_name_to_id: Optional[dict[str, str]] = None,
+    ) -> list[dict]:
+        """Collect upstream task results for dependency injection.
+
+        Uses explicit task_name_to_id index for precise lookups, falling back
+        to fuzzy matching only when the index does not contain a dependency name.
+        Handles edge cases: duplicate names (first wins), missing deps (skipped),
+        and upstream failures (included with failed status).
+        """
         deps = subtask.get("depends_on", [])
         if not deps:
             return []
+
+        # Build task_id_to_result from subtask_results for O(1) lookup
+        task_id_to_result = {sid: sresult for sid, sresult in subtask_results.items()}
+
         results = []
         for dep_name in deps:
-            # Try to find matching result by task_name or task_id
-            for sid, sresult in subtask_results.items():
-                worker = sresult.get("worker")
-                worker_name = getattr(worker, "task_id", "") if worker else ""
-                if dep_name in sid or dep_name == worker_name:
-                    results.append({
-                        "task_id": sid,
-                        "final_content": sresult.get("final_content", ""),
-                        "status": getattr(worker, "status", "unknown") if worker else "unknown",
-                    })
-                    break
+            target_id = None
+
+            # 1. Try explicit name-to-id index first
+            if task_name_to_id and dep_name in task_name_to_id:
+                target_id = task_name_to_id[dep_name]
+
+            # 2. Fallback: fuzzy match by task_id substring or worker task_id
+            if target_id is None:
+                for sid, sresult in subtask_results.items():
+                    worker = sresult.get("worker")
+                    worker_name = getattr(worker, "task_id", "") if worker else ""
+                    if dep_name in sid or dep_name == worker_name:
+                        target_id = sid
+                        break
+
+            # 3. Dependency not found — skip with warning in context
+            if target_id is None or target_id not in task_id_to_result:
+                continue
+
+            sresult = task_id_to_result[target_id]
+            worker = sresult.get("worker")
+            results.append({
+                "task_id": target_id,
+                "final_content": sresult.get("final_content", ""),
+                "status": getattr(worker, "status", "unknown") if worker else "unknown",
+            })
         return results
 
     def _execute_subtask(
@@ -672,6 +713,7 @@ class WorkflowEngine:
         mode: str,
         max_retries: int,
         subtask_results: dict = None,
+        task_name_to_id: Optional[dict[str, str]] = None,
     ) -> dict:
         # Phase 3: Check budget before executing subtask
         if not self.budget_controller.can_call_model(workflow_id):
@@ -686,7 +728,9 @@ class WorkflowEngine:
         timeout_seconds = int(self.runtime_config.get("timeout_seconds", 120) or 120)
 
         # Phase 3: Build runtime context for this subtask
-        dep_results = self._collect_dependency_results(subtask, subtask_results or {})
+        dep_results = self._collect_dependency_results(
+            subtask, subtask_results or {}, task_name_to_id=task_name_to_id,
+        )
         self.context_manager.build_runtime_context(
             task_id=subtask_id,
             objective=subtask.get("objective", ""),
@@ -737,30 +781,52 @@ class WorkflowEngine:
         self._record("Worker", worker_contract, worker_resp)
         current_content = worker_resp.content
 
+        # P1-3: Track initial Worker output for Verifier context
+        initial_worker_output = current_content
+
         if worker_resp.needs_review():
             decision = self.supervisor.event_handling.handle("low_confidence", {"role": "Worker", "subtask": subtask.get("task_name", "")})
             self._publish_replan_signal(workflow_id, subtask_id, worker_resp, "worker_low_confidence")
 
+        # P1-3: Collect Critic findings across retries for Verifier context
+        all_critic_findings: list[str] = []
+
         critic_resp = AgentResponse(task_id=subtask_id, role="Critic", status="completed")
         for retry in range(max_retries + 1):
+            # P1-3: Critic TaskContract with full context
+            critic_objective = (
+                f"审查 Worker 输出质量。原始目标: {subtask.get('objective', '')}。"
+                f"用户约束: {self.runtime_config.get('permission_mode', 'workspace_only')} 模式，"
+                f"允许工具: {allowed_tools or []}。"
+            )
             critic_contract = TaskContract(
                 task_id=f"{subtask_id}-CRITIC",
                 task_name=f"审查 {subtask.get('task_name', '')}",
                 task_type="review",
                 role="Critic",
-                objective="审查 Worker 输出质量",
+                objective=critic_objective,
                 input_refs=[subtask_id],
                 assigned_model=critic_model,
                 required_capabilities=["critic", "reasoning"],
                 allowed_tools=allowed_tools,
                 expected_output_schema="review_result",
-                success_criteria=["找出所有问题点"],
+                success_criteria=list(subtask.get("success_criteria", ["找出所有问题点"])),
                 timeout_seconds=timeout_seconds,
             )
+            # P1-3: Critic receives Worker output + upstream deps in context
+            critic_context_messages: list[ChatMessage] = []
+            if dep_results:
+                for dr in dep_results:
+                    content_preview = dr["final_content"][:2000] if dr["final_content"] else ""
+                    critic_context_messages.append(ChatMessage(
+                        role="system",
+                        content=f"## 上游依赖 {dr['task_id']} (状态: {dr['status']})\n\n{content_preview}",
+                    ))
+            critic_context_messages.append(ChatMessage(role="user", content=f"## Worker 输出\n\n{current_content}"))
             critic_resp = self.runner.run(
                 critic_contract,
                 critic_model,
-                context_messages=[ChatMessage(role="user", content=f"## Worker 输出\n\n{current_content}")],
+                context_messages=critic_context_messages or None,
                 stream_session=self.stream_session,
             )
             self._execute_tool_calls(critic_resp, "Critic", f"{subtask_id}-CRITIC", allowed_tools=allowed_tools)
@@ -768,6 +834,10 @@ class WorkflowEngine:
             verdict = (critic_resp.next_action_recommendation or "").lower()
             if "pass" in verdict:
                 break
+
+            # P1-3: Collect Critic findings for Verifier context
+            if critic_resp.content:
+                all_critic_findings.append(f"[第{retry + 1}轮审查] {critic_resp.content[:500]}")
 
             self.event_bus.publish(
                 EVENT_REVIEW_FAILED,
@@ -808,24 +878,44 @@ class WorkflowEngine:
             if revision_resp.needs_review():
                 self._publish_replan_signal(workflow_id, subtask_id, revision_resp, "revision_low_confidence")
 
+        # P1-3: Verifier TaskContract with complete context
+        verifier_objective = (
+            f"验证最终版本是否满足要求。原始目标: {subtask.get('objective', '')}。"
+            f"需逐项验收成功标准。"
+        )
         verifier_contract = TaskContract(
             task_id=f"{subtask_id}-VERIFY",
             task_name=f"校验 {subtask.get('task_name', '')}",
             task_type="verification",
             role="Verifier",
-            objective="验证最终版本是否满足要求",
+            objective=verifier_objective,
             input_refs=[subtask_id],
             assigned_model=verifier_model,
             required_capabilities=["verification", "reasoning"],
             allowed_tools=allowed_tools,
             expected_output_schema="verification_result",
-            success_criteria=["Critic 问题已解决"],
+            success_criteria=list(subtask.get("success_criteria", ["Critic 问题已解决"])),
             timeout_seconds=timeout_seconds,
         )
+        # P1-3: Verifier receives full context — initial output, critic findings, final output
+        verifier_context_messages: list[ChatMessage] = []
+        verifier_context_messages.append(ChatMessage(
+            role="system",
+            content=f"## Worker 初稿\n\n{initial_worker_output[:2000]}",
+        ))
+        if all_critic_findings:
+            verifier_context_messages.append(ChatMessage(
+                role="system",
+                content=f"## Critic 问题清单\n\n" + "\n---\n".join(all_critic_findings),
+            ))
+        verifier_context_messages.append(ChatMessage(
+            role="user",
+            content=f"## 最终输出\n\n{current_content}",
+        ))
         verifier_resp = self.runner.run(
             verifier_contract,
             verifier_model,
-            context_messages=[ChatMessage(role="user", content=f"## 最终输出\n\n{current_content}")],
+            context_messages=verifier_context_messages or None,
             stream_session=self.stream_session,
         )
         self._execute_tool_calls(verifier_resp, "Verifier", f"{subtask_id}-VERIFY", allowed_tools=allowed_tools)

@@ -134,7 +134,13 @@ class RoleRunner:
         return self._parse_response(contract, resp)
 
     def _parse_response(self, contract: TaskContract, resp: ModelResponse) -> AgentResponse:
-        """从模型原始输出中解析 AgentResponse，包含工具调用请求"""
+        """从模型原始输出中解析 AgentResponse，包含工具调用请求。
+
+        P1-2 Schema 强制校验：
+        - JSON 解析失败 → status="schema_error"
+        - validate() 失败 → status="schema_error"
+        - 正常解析 + 通过校验 → 返回有效 AgentResponse
+        """
         content = resp.content.strip()
 
         # 尝试提取 JSON（模型可能输出 markdown 代码块）
@@ -144,29 +150,63 @@ class RoleRunner:
             import json
             try:
                 data = json.loads(json_str)
-                result_dict = {
-                    "task_id": contract.task_id,
-                    "role": contract.role,
-                    "status": data.get("status", "completed"),
-                    "summary": data.get("summary", ""),
-                    "content": data.get("content", content),
-                    "claims": data.get("claims", []),
-                    "risks": data.get("risks", []),
-                    "next_action_recommendation": data.get("next_action_recommendation", ""),
-                    "tool_calls": data.get("tool_calls", []),
-                }
-                return AgentResponse.from_dict(result_dict)
             except json.JSONDecodeError:
-                pass
+                # JSON 解析失败
+                return AgentResponse(
+                    task_id=contract.task_id,
+                    role=contract.role,
+                    status="schema_error",
+                    summary=f"JSON 解析失败: 模型输出无法解析为有效 JSON",
+                    content=content,
+                )
 
-        # 兜底：整段内容作为 summary
-        return AgentResponse(
+            result_dict = {
+                "task_id": contract.task_id,
+                "role": contract.role,
+                "status": data.get("status", "completed"),
+                "summary": data.get("summary", ""),
+                "content": data.get("content", content),
+                "claims": data.get("claims", []),
+                "risks": data.get("risks", []),
+                "next_action_recommendation": data.get("next_action_recommendation", ""),
+                "tool_calls": data.get("tool_calls", []),
+            }
+            response = AgentResponse.from_dict(result_dict)
+
+            # P1-2: 强制 schema 校验
+            validation_errors = response.validate()
+            if validation_errors:
+                return AgentResponse(
+                    task_id=contract.task_id,
+                    role=contract.role,
+                    status="schema_error",
+                    summary=f"Schema 校验失败: {'; '.join(validation_errors)}",
+                    content=content,
+                )
+
+            return response
+
+        # 兜底：整段内容作为 summary（无 JSON 结构时）
+        response = AgentResponse(
             task_id=contract.task_id,
             role=contract.role,
             status="completed",
             summary=content[:200],
             content=content,
         )
+
+        # P1-2: 兜底响应也需校验
+        validation_errors = response.validate()
+        if validation_errors:
+            return AgentResponse(
+                task_id=contract.task_id,
+                role=contract.role,
+                status="schema_error",
+                summary=f"Schema 校验失败: {'; '.join(validation_errors)}",
+                content=content,
+            )
+
+        return response
 
     @staticmethod
     def _extract_json(text: str) -> Optional[str]:
