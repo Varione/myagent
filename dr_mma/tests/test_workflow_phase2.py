@@ -162,7 +162,7 @@ class TestDirectModeExecution:
         engine, adapter, pool = _make_engine_with_mock(["mock-primary"])
         result = engine.execute("简单问题：1+1等于几？")
         assert isinstance(result, WorkflowResult)
-        assert result.task_id.startswith("WF-")
+        assert result.task_id.lower().startswith("wf-")
         assert result.mode  # should have a mode set
 
     def test_direct_mode_has_final_output(self):

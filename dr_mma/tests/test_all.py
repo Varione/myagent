@@ -484,40 +484,58 @@ class TestDecisionLog:
 
     def test_log_and_count(self, tmp_file):
         log = DecisionLog(tmp_file)
-        assert log.count() == 0
-        log.log("T-001", "plan_created", "任务已规划")
-        assert log.count() == 1
+        try:
+            assert log.count() == 0
+            log.log("T-001", "plan_created", "任务已规划")
+            assert log.count() == 1
+        finally:
+            log.close()
 
     def test_query_by_task_id(self, tmp_file):
         log = DecisionLog(tmp_file)
-        log.log("T-001", "decision_a", "决策A")
-        log.log("T-002", "decision_b", "决策B")
-        results = log.query(task_id="T-001")
-        assert len(results) == 1
-        assert results[0].decision == "decision_a"
+        try:
+            log.log("T-001", "decision_a", "决策A")
+            log.log("T-002", "decision_b", "决策B")
+            results = log.query(task_id="T-001")
+            assert len(results) == 1
+            assert results[0].decision == "decision_a"
+        finally:
+            log.close()
 
     def test_query_by_decision_type(self, tmp_file):
         log = DecisionLog(tmp_file)
-        log.log("T-001", "retry", "重试")
-        log.log("T-002", "complete", "完成")
-        results = log.query(decision="retry")
-        assert len(results) == 1
+        try:
+            log.log("T-001", "retry", "重试")
+            log.log("T-002", "complete", "完成")
+            results = log.query(decision="retry")
+            assert len(results) == 1
+        finally:
+            log.close()
 
     def test_persistence(self, tmp_file):
         log1 = DecisionLog(tmp_file)
-        log1.log("T-001", "test", "持久化测试", {"extra": "data"})
+        try:
+            log1.log("T-001", "test", "持久化测试", {"extra": "data"})
+        finally:
+            log1.close()
         log2 = DecisionLog(tmp_file)
-        assert log2.count() == 1
-        rec = log2.query(task_id="T-001")[0]
-        assert rec.rationale == "持久化测试"
-        assert rec.context["extra"] == "data"
+        try:
+            assert log2.count() == 1
+            rec = log2.query(task_id="T-001")[0]
+            assert rec.rationale == "持久化测试"
+            assert rec.context["extra"] == "data"
+        finally:
+            log2.close()
 
     def test_query_limit(self, tmp_file):
         log = DecisionLog(tmp_file)
-        for i in range(5):
-            log.log(f"T-{i:03d}", "test", f"决策{i}")
-        results = log.query(limit=2)
-        assert len(results) == 2
+        try:
+            for i in range(5):
+                log.log(f"T-{i:03d}", "test", f"决策{i}")
+            results = log.query(limit=2)
+            assert len(results) == 2
+        finally:
+            log.close()
 
 
 # ─── Engine Tests ────────────────────────────────

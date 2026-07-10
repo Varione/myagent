@@ -42,6 +42,7 @@ from .role_manager import RoleBinding, RoleMergerSplitter
 from .tool_executor import ToolExecutor
 from .tools import ToolRegistry, create_default_tool_registry
 from .budget_controller import BudgetController
+from .id_utils import make_id
 from .context_manager import ContextManager
 from .observability import EventTracer, DAGGraph, DiagnosticsPanel, EventType as ObsEventType
 from .supervisor_modules import SupervisorOrchestrator
@@ -161,7 +162,7 @@ class WorkflowEngine:
         self._ensure_pool_populated(primary_model)
         self.model_pool.health_check_all()
 
-        result = WorkflowResult(task_id=f"WF-{hash(user_task) % 100000:05d}")
+        result = WorkflowResult(task_id=make_id("wf"))
         result.runtime_config = dict(self.runtime_config)
         self._current_workflow_id = result.task_id
 
@@ -415,6 +416,7 @@ class WorkflowEngine:
                     assignments=assignments,
                     mode=mode,
                     max_retries=max_retries,
+                    subtask_results=subtask_results,
                 )
                 result.dag_nodes[idx]["status"] = self._derive_subtask_status(
                     subtask_results[sub_id]
@@ -433,6 +435,7 @@ class WorkflowEngine:
                             assignments=assignments,
                             mode=mode,
                             max_retries=max_retries,
+                            subtask_results=subtask_results,
                         )
                         future_map[future] = (idx, sub_id)
 
@@ -482,6 +485,7 @@ class WorkflowEngine:
                 assignments=assignments,
                 mode=mode,
                 max_retries=max_retries,
+                subtask_results=subtask_results,
             )
             result.dag_nodes[idx]["status"] = self._derive_subtask_status(
                 subtask_results[sub_id]
@@ -639,6 +643,26 @@ class WorkflowEngine:
         )
         return self._parse_subtasks(response.content)
 
+    def _collect_dependency_results(self, subtask: dict, subtask_results: dict) -> list[dict]:
+        """Collect upstream task results for dependency injection."""
+        deps = subtask.get("depends_on", [])
+        if not deps:
+            return []
+        results = []
+        for dep_name in deps:
+            # Try to find matching result by task_name or task_id
+            for sid, sresult in subtask_results.items():
+                worker = sresult.get("worker")
+                worker_name = getattr(worker, "task_id", "") if worker else ""
+                if dep_name in sid or dep_name == worker_name:
+                    results.append({
+                        "task_id": sid,
+                        "final_content": sresult.get("final_content", ""),
+                        "status": getattr(worker, "status", "unknown") if worker else "unknown",
+                    })
+                    break
+        return results
+
     def _execute_subtask(
         self,
         workflow_id: str,
@@ -647,6 +671,7 @@ class WorkflowEngine:
         assignments: dict[str, str],
         mode: str,
         max_retries: int,
+        subtask_results: dict = None,
     ) -> dict:
         # Phase 3: Check budget before executing subtask
         if not self.budget_controller.can_call_model(workflow_id):
@@ -661,6 +686,7 @@ class WorkflowEngine:
         timeout_seconds = int(self.runtime_config.get("timeout_seconds", 120) or 120)
 
         # Phase 3: Build runtime context for this subtask
+        dep_results = self._collect_dependency_results(subtask, subtask_results or {})
         self.context_manager.build_runtime_context(
             task_id=subtask_id,
             objective=subtask.get("objective", ""),
@@ -668,7 +694,16 @@ class WorkflowEngine:
         )
         self.context_manager.update_subtask_status(workflow_id, subtask_id, "running")
 
-        shared_context = []
+        # Inject upstream dependency results into context
+        shared_dep_context: list[ChatMessage] = []
+        for dr in dep_results:
+            content_preview = dr["final_content"][:2000] if dr["final_content"] else ""
+            shared_dep_context.append(ChatMessage(
+                role="system",
+                content=f"## 上游任务 {dr['task_id']} (状态: {dr['status']})\n\n{content_preview}",
+            ))
+
+        shared_context = list(shared_dep_context)
         if mode == MODE_EXPANDED:
             shared_context.extend(self._build_support_context(subtask_id, subtask, researcher_model, expert_model))
 
@@ -834,7 +869,7 @@ class WorkflowEngine:
             task_id=f"{subtask_id}-RESEARCH",
             task_name=f"研究 {subtask.get('task_name', '')}",
             task_type="research",
-            role="Worker",
+            role="Researcher",
             objective=f"为子任务提供实现资料和风险线索: {subtask.get('objective', '')}",
             assigned_model=researcher_model,
             required_capabilities=["research", "tool_use"],
@@ -852,7 +887,7 @@ class WorkflowEngine:
             task_id=f"{subtask_id}-EXPERT",
             task_name=f"专家建议 {subtask.get('task_name', '')}",
             task_type="domain_review",
-            role="Worker",
+            role="Domain Expert",
             objective=f"从领域视角指出关键约束和风险: {subtask.get('objective', '')}",
             assigned_model=expert_model,
             required_capabilities=["domain_knowledge", "reasoning"],
@@ -867,12 +902,57 @@ class WorkflowEngine:
         messages.append(ChatMessage(role="user", content=f"## Domain Expert Notes\n\n{expert_resp.content}"))
         return messages
 
+    def _build_synthesis_packet(self, subtask_id: str, subtask_result: dict) -> str:
+        """Build structured summary for Supervisor synthesis."""
+        content = subtask_result.get("final_content", "")
+        worker = subtask_result.get("worker")
+
+        # Get status and confidence from worker response
+        status = getattr(worker, "status", "unknown") if worker else "unknown"
+        confidence = getattr(worker, "confidence", None) if worker else None
+        summary = getattr(worker, "summary", "") if worker else ""
+
+        # Build structured packet
+        packet = f"### 子任务 {subtask_id}\n"
+        packet += f"**状态**: {status}"
+        if confidence is not None:
+            packet += f" | **置信度**: {confidence}"
+        packet += "\n\n"
+
+        # Include full summary from worker (typically concise)
+        if summary:
+            packet += f"**摘要**: {summary}\n\n"
+
+        # Include full content if short enough, otherwise smart truncation
+        if len(content) <= 1500:
+            packet += content
+        else:
+            # Keep first 800 chars (usually contains key findings)
+            packet += content[:800]
+            packet += "\n\n...[内容已截断，详见子任务完整输出]..."
+            # Always include last 400 chars (usually contains conclusions)
+            last_part = content[-400:]
+            if last_part not in content[:800]:
+                packet += f"\n\n**结尾**: ...{last_part}"
+
+        packet += "\n\n"
+
+        # Include critic/verifier reports if available
+        critic = subtask_result.get("critic")
+        if critic and hasattr(critic, "to_dict"):
+            cdict = critic.to_dict()
+            issues = cdict.get("issues", [])
+            if issues:
+                packet += f"**审查意见**: {issues[:3]}\n\n"
+
+        return packet
+
     def _summarize(self, workflow_id: str, subtask_results: dict, model_name: str) -> AgentResponse:
         summary_text = ""
         critic_reports: list[dict] = []
         verifier_reports: list[dict] = []
         for subtask_id, subtask_result in subtask_results.items():
-            summary_text += f"### 子任务 {subtask_id}\n{subtask_result['final_content'][:400]}\n\n"
+            summary_text += self._build_synthesis_packet(subtask_id, subtask_result)
             critic_resp = subtask_result.get("critic")
             if critic_resp and hasattr(critic_resp, "to_dict"):
                 critic_reports.append(critic_resp.to_dict())
@@ -1062,11 +1142,17 @@ class WorkflowEngine:
 
         # Phase 3: track budget per model call (use workflow-level budget)
         budget_task_id = getattr(self, '_current_workflow_id', None) or contract.task_id
+        # Estimate tokens from response content length (~4 chars per token average)
+        estimated_tokens = len(response.content) // 4 if response.content else 0
+        # Rough cost estimate (assume $0.001 per 1K tokens as default)
+        estimated_cost = estimated_tokens * 0.001 / 1000
+        is_high = estimated_tokens > 10000
+
         self.budget_controller.record_model_call(
             task_id=budget_task_id,
-            tokens=0,
-            cost=0.0,
-            is_high_cost=False,
+            tokens=estimated_tokens,
+            cost=estimated_cost,
+            is_high_cost=is_high,
         )
         self.event_tracer.record(
             ObsEventType.TOOL_CALLED,
