@@ -1,66 +1,98 @@
 """
-Blackboard — 黑板持久化存储
+Blackboard — 黑板持久化存储 (SQLite)
 
-MVP 使用 JSONL 文件作为存储后端，每条记录是一个 BlackboardEntry。
-支持追加写入和按条件查询。
+使用 SQLite 存储 agent 执行过程中的中间结果。支持事务、索引查询、
+上下文管理器和按条件过滤。
 """
 
-from typing import Optional
-from pathlib import Path
 import json
+import sqlite3
+from pathlib import Path
+from typing import Optional
 
 from ..schemas.blackboard_entry import BlackboardEntry
 
 
+# ── SQL ─────────────────────────────────────────────────────────────────────
+
+_CREATE_TABLE = """\
+    CREATE TABLE IF NOT EXISTS blackboard (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id      TEXT    NOT NULL UNIQUE,
+        task_id       TEXT    NOT NULL DEFAULT '',
+        source_role   TEXT    NOT NULL DEFAULT '',
+        content_type  TEXT    NOT NULL DEFAULT '',
+        summary       TEXT    NOT NULL DEFAULT '',
+        payload       TEXT    NOT NULL DEFAULT '{}',
+        created_at    TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_bb_entry_id     ON blackboard(entry_id);
+    CREATE INDEX IF NOT EXISTS idx_bb_task_id      ON blackboard(task_id);
+    CREATE INDEX IF NOT EXISTS idx_bb_source_role  ON blackboard(source_role);
+    CREATE INDEX IF NOT EXISTS idx_bb_content_type ON blackboard(content_type);
+    CREATE INDEX IF NOT EXISTS idx_bb_created_at   ON blackboard(created_at);
+"""
+
+
 class Blackboard:
-    """黑板：agent 执行过程中的中间结果存储"""
+    """黑板：agent 执行过程中的中间结果存储 (SQLite 后端)"""
 
-    def __init__(self, filepath: str | Path):
-        self._filepath = Path(filepath)
-        self._entries: list[BlackboardEntry] = []
+    def __init__(self, db_path: str | Path):
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.executescript(_CREATE_TABLE)
+        self._conn.commit()
+        self._is_open = True
 
-        # 如果文件存在，加载历史数据
-        if self._filepath.exists():
-            self._load()
+    # -- Connection management --
 
-    def _load(self):
-        """从 JSONL 文件加载已有条目"""
-        self._entries = []
-        try:
-            with open(self._filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            self._entries.append(BlackboardEntry.from_dict(data))
-                        except json.JSONDecodeError:
-                            continue
-        except (IOError, OSError):
-            self._entries = []
+    def close(self):
+        """关闭数据库连接"""
+        if self._is_open and self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._is_open = False
 
-    def _append_to_file(self, entry: BlackboardEntry):
-        """追加一条记录到 JSONL 文件"""
-        self._filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._filepath, "a", encoding="utf-8") as f:
-            f.write(entry.to_json_line() + "\n")
+    def __del__(self):
+        """析构时自动关闭连接"""
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     # ── 写操作 ──
 
     def write(self, entry: BlackboardEntry) -> str:
         """写入一条记录，返回 entry_id"""
-        self._entries.append(entry)
-        self._append_to_file(entry)
+        payload_json = json.dumps(entry.payload, ensure_ascii=False)
+        self._conn.execute(
+            "INSERT INTO blackboard (entry_id, task_id, source_role, content_type, summary, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (entry.entry_id, entry.task_id, entry.source_role,
+             entry.content_type, entry.summary, payload_json, entry.created_at),
+        )
+        self._conn.commit()
         return entry.entry_id
 
     # ── 读操作 ──
 
     def read(self, entry_id: str) -> Optional[BlackboardEntry]:
         """按 entry_id 读取单条"""
-        for e in self._entries:
-            if e.entry_id == entry_id:
-                return e
-        return None
+        row = self._conn.execute(
+            "SELECT entry_id, task_id, source_role, content_type, summary, payload, created_at "
+            "FROM blackboard WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_entry(row)
 
     def query(
         self,
@@ -68,31 +100,71 @@ class Blackboard:
         source_role: str = "",
         content_type: str = "",
         limit: int = 0,
+        offset: int = 0,
     ) -> list[BlackboardEntry]:
         """按条件查询黑板条目"""
-        results = list(self._entries)
+        conditions: list[str] = []
+        params: list = []
 
         if task_id:
-            results = [e for e in results if e.task_id == task_id]
+            conditions.append("task_id = ?")
+            params.append(task_id)
         if source_role:
-            results = [e for e in results if e.source_role == source_role]
+            conditions.append("source_role = ?")
+            params.append(source_role)
         if content_type:
-            results = [e for e in results if e.content_type == content_type]
-        if limit > 0:
-            results = results[-limit:]
+            conditions.append("content_type = ?")
+            params.append(content_type)
 
-        return results
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        query = f"SELECT entry_id, task_id, source_role, content_type, summary, payload, created_at FROM blackboard{where} ORDER BY created_at ASC"
+
+        if limit > 0:
+            query += f" LIMIT {limit} OFFSET {offset}"
+
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_entry(r) for r in rows]
 
     def get_latest(self, task_id: str = "") -> Optional[BlackboardEntry]:
         """获取最新一条记录"""
-        entries = self.query(task_id=task_id) if task_id else self._entries
-        return entries[-1] if entries else None
+        query = "SELECT entry_id, task_id, source_role, content_type, summary, payload, created_at FROM blackboard"
+        params: list = []
+        if task_id:
+            query += " WHERE task_id = ?"
+            params.append(task_id)
+        query += " ORDER BY id DESC LIMIT 1"
+        row = self._conn.execute(query, params).fetchone()
+        return self._row_to_entry(row) if row else None
+
+    # ── 统计与维护 ──
 
     def count(self) -> int:
-        return len(self._entries)
+        """统计条目数"""
+        row = self._conn.execute("SELECT COUNT(*) FROM blackboard").fetchone()
+        return row[0] if row else 0
 
     def clear(self):
-        """清空所有条目（谨慎使用）"""
-        self._entries = []
-        if self._filepath.exists():
-            self._filepath.unlink()
+        """清空所有条目（SQLite 后端保留数据库文件，只清除数据）"""
+        self._conn.execute("DELETE FROM blackboard")
+        self._conn.commit()
+
+    def delete(self, entry_id: str) -> bool:
+        """删除指定条目"""
+        cursor = self._conn.execute(
+            "DELETE FROM blackboard WHERE entry_id = ?", (entry_id,))
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # ── Helper ──
+
+    @staticmethod
+    def _row_to_entry(row: tuple) -> BlackboardEntry:
+        return BlackboardEntry(
+            entry_id=row[0],
+            task_id=row[1],
+            source_role=row[2],
+            content_type=row[3],
+            summary=row[4],
+            payload=json.loads(row[5]) if row[5] else {},
+            created_at=row[6],
+        )
