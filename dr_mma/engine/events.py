@@ -56,7 +56,6 @@ class EventBus:
 
     def __init__(self, max_history: int = 10000):
         self._bus = _EventBus(max_history=max_history)
-        self._events: list[WorkflowEvent] = []
 
     # -- Publish (workflow-compatible) --
 
@@ -74,9 +73,8 @@ class EventBus:
             task_id=task_id,
             payload=payload or {},
         )
-        self._events.append(event)
 
-        # Also publish to the underlying bus for subscribers/SSE/history
+        # Publish to the canonical bus (single source of truth)
         self._bus.publish(
             event_type,
             data=event.to_dict(),
@@ -101,18 +99,27 @@ class EventBus:
 
     # -- Query (workflow-compatible) --
 
+    @staticmethod
+    def _from_session_event(se: SessionEvent) -> WorkflowEvent:
+        """Reconstruct a WorkflowEvent from a canonical SessionEvent's data."""
+        d = se.data if isinstance(se.data, dict) else {}
+        return WorkflowEvent(
+            event_type=d.get("event_type", se.event_type),
+            source=d.get("source", se.source),
+            task_id=d.get("task_id", se.session_id),
+            payload=d.get("payload", {}),
+            event_id=d.get("event_id", se.event_id),
+            created_at=d.get("created_at", se.created_at),
+        )
+
     def query(self, event_type: str = "", task_id: str = "") -> list[WorkflowEvent]:
-        """Query workflow events by type and/or task_id."""
-        results = list(self._events)
-        if event_type:
-            results = [e for e in results if e.event_type == event_type]
-        if task_id:
-            results = [e for e in results if e.task_id == task_id]
-        return results
+        """Query workflow events by type and/or task_id (delegated to canonical bus)."""
+        results = self._bus.query(event_type=event_type, session_id=task_id)
+        return [self._from_session_event(e) for e in results]
 
     def all_events(self) -> list[WorkflowEvent]:
-        """Return all workflow events."""
-        return list(self._events)
+        """Return all workflow events (delegated to canonical bus)."""
+        return [self._from_session_event(e) for e in self._bus.all_events()]
 
     # -- History / SSE (delegated to underlying bus) --
 

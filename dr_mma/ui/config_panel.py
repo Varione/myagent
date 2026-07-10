@@ -411,9 +411,9 @@ class ConfigPanel(ctk.CTkFrame):
         timeout_text = self._timeout_entry.get().strip()
         if path:
             path = path.replace("\\", "/")
-            self.controller.config["blackboard_path"] = f"{path}/blackboard.jsonl"
-            self.controller.config["artifact_path"] = f"{path}/artifacts.jsonl"
-            self.controller.config["decision_path"] = f"{path}/decisions.jsonl"
+            self.controller.config["blackboard_path"] = f"{path}/blackboard.db"
+            self.controller.config["artifact_path"] = f"{path}/artifacts.db"
+            self.controller.config["decision_path"] = f"{path}/decisions.db"
         if workspace_root:
             self.controller.config["workspace_root"] = workspace_root
         self.controller.config["allowed_tools"] = [item.strip() for item in tools_text.split(",") if item.strip()]

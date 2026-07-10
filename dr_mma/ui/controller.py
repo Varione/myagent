@@ -279,9 +279,9 @@ class WorkflowController:
         base = Path("dr_mma_data")
         base.mkdir(exist_ok=True)
         defaults = {
-            "blackboard_path": str(base / "blackboard.jsonl"),
-            "artifact_path": str(base / "artifacts.jsonl"),
-            "decision_path": str(base / "decisions.jsonl"),
+            "blackboard_path": str(base / "blackboard.db"),
+            "artifact_path": str(base / "artifacts.db"),
+            "decision_path": str(base / "decisions.db"),
         }
         for key, value in defaults.items():
             if not self.config.get(key):
